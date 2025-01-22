@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+crawl4ai
+uvloop
+beautifulsoup4
+firebase-admin
+google-cloud-firestore
+upstash-redis
+apscheduler
+pydantic
