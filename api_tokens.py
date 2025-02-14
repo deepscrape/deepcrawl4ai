@@ -2,6 +2,7 @@ from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from firestore import auth
 
+
 security = HTTPBearer()
 
 

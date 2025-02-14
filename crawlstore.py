@@ -1,7 +1,4 @@
-from firestore import db
-
-
-async def updateCrawlOperation(userId, operation_id, data):
+async def updateCrawlOperation(userId, operation_id, data, db):
     try:
         # Update Firestore document
         doc_ref = db.collection(f"users/{userId}/operations").document(operation_id)
@@ -15,7 +12,7 @@ async def updateCrawlOperation(userId, operation_id, data):
         )
 
 
-async def getCrawlMetadata(metadataId, userId):
+async def getCrawlMetadata(metadataId, userId, db):
     """
 
     Asynchronously updates a Firestore document for a user's crawl operation.

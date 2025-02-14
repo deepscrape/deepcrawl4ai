@@ -8,3 +8,7 @@ google-cloud-firestore
 upstash-redis
 apscheduler
 pydantic
+psutil
+aiomultiprocess
+prometheus_client
+redis[hiredis]

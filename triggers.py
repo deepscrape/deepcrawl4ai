@@ -4,13 +4,13 @@ import time
 from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
+    CrawlResult,
     DefaultMarkdownGenerator,
-    LLMExtractionStrategy,
     PruningContentFilter,
 )
 from fastapi import HTTPException
 
-from actions import basic_crwal  # , infinite_scroll
+from actions import basic_crawl  # , infinite_scroll
 # from dynamic_selectors import auto_detect_selectors
 
 from pydantic import BaseModel
@@ -45,7 +45,7 @@ async def event_stream(url):
 
         # "https://www.scrapingcourse.com/infinite-scrolling"
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await basic_crwal(
+            result = await basic_crawl(
                 url=url,
                 crawler=crawler,
                 markdown_generator=markdown_generator,
@@ -168,7 +168,7 @@ async def json_basic_crawl(url):
 
         # "https://www.scrapingcourse.com/infinite-scrolling"
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await basic_crwal(
+            result = await basic_crawl(
                 url=url,
                 crawler=crawler,
                 markdown_generator=markdown_generator,
@@ -212,68 +212,48 @@ async def json_basic_crawl(url):
         )
 
 
-async def basic_crawl_operation(url):
+async def basic_crawl_operation(
+    url, crawler: AsyncWebCrawler, crawl_config, markdown_generator, session_id
+):
     """Generate basic crawler."""
 
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=True,  # corrected from 'verbos=False'
-        extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
-        browser_type="chromium",
-        viewport_height=600,
-        viewport_width=800,  # Smaller viewport for better performance
-    )  # Default browser configuration
-
-    markdown_generator = DefaultMarkdownGenerator(
-        content_filter=PruningContentFilter(
-            # Lower → more content retained, higher → more content pruned
-            threshold=0.45,
-            # "fixed" or "dynamic"
-            threshold_type="dynamic",
-            # Ignore nodes with <5 words
-            min_word_threshold=5,
-        ),  # In case you need fit_markdown
-    )
-
-    # 1. Define the LLM extraction strategy
-    llm_strategy = LLMExtractionStrategy(
-        provider="openai/gpt-4o-mini",  # e.g. "ollama/llama2"
-        api_token=os.getenv("OPENAI_API_KEY"),
-        schema=Product.model_json_schema(),  # Or use model_json_schema()
-        extraction_type="schema",
-        instruction="Extract all recipe from the content.",
-        chunk_token_threshold=1000,
-        overlap_rate=0.1,
-        apply_chunking=True,
-        input_format="markdown",  # or "html", "fit_markdown"
-        extra_args={"temperature": 0.0, "max_tokens": 800},
-    )
-
     try:
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await basic_crwal(
-                url=url,
-                crawler=crawler,
-                markdown_generator=markdown_generator,
-                session_id="hn_session",
-                llm_strategy=llm_strategy,
-            )
+        result = await crawler.arun(
+            url=url,
+            config=crawl_config,
+            session_id=session_id,
+            markdown_generator=markdown_generator,
+        )
 
-            if result.success:
-                # 5. The extracted content is presumably JSON
-                data = json.loads(result.extracted_content)
-                print("Extracted items:", data)
+        # await basic_crawl(
+        #     url=url,
+        #     crawler=crawler,
+        #     markdown_generator=markdown_generator,
+        #     session_id="hn_session",
+        #     # llm_strategy=None,
+        # )
 
-                # 6. Show usage stats
-                llm_strategy.show_usage()  # prints token usage
-                return data
-            else:
-                print("Error:", result.error_message)
-                raise Exception(result.error_message)
+        if result.success:
+            # 5. The extracted content is presumably JSON
+            # data = json.loads(result.extracted_content)
+            # print("Extracted items:", data)
 
             # selectors = auto_detect_selectors(result.html)
             # print("CSS Selectors:", selectors['css_selectors'])
-            # return result.markdown  # Most relevant content in markdown format
+            # return result  # Most relevant content in markdown format
+            # 6. Show usage stats
+            # llm_strategy.show_usage()  # prints token usage
+            # return data
+            print("Results:", "Yes")
+        else:
+            print("Error:", result.error_message)
+            # raise Exception(result.error_message)
+
+        return result
     except Exception as e:
         # Log the exception and raise an HTTPException
         print(f"Error occurred: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal Server Error while returning array buffer.",
+        )

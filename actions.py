@@ -212,7 +212,7 @@ async def load_more(
         return result2
 
 
-async def basic_crwal(
+async def basic_crawl(
     crawler: AsyncWebCrawler,
     markdown_generator,
     url="https://www.scrapingcourse.com/button-click",

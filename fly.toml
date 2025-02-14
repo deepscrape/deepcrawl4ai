@@ -7,9 +7,11 @@ app = 'deepcrawl4ai'
 primary_region = 'fra'
 
 [build]
-  #[build.env]
+  [env]
   #CELERY_BROKER_URL = "amqp://guest:guest@localhost:5672//"
   #RAY_ADDRESS = "ray://localhost:6379"
+  UPSTASH_REDIS_REST_URL="https://gusc1-saved-terrapin-30766.upstash.io"
+
 [http_service]
   internal_port = 8000
   force_https = true
