@@ -287,9 +287,6 @@ async def process_task_with_monitoring(max_concurrent=3, task_dataList=None):
     # Start monitoring metrics
     start_time = time.time()
 
-    # set monitor pid
-    monitor = WorkerMonitor(os.getpid())
-
     task_data = task_dataList
     print("task_data: ", task_data)
 
@@ -305,6 +302,9 @@ async def process_task_with_monitoring(max_concurrent=3, task_dataList=None):
 
     # init client firebase
     db, auth = client.init_firebase()
+
+    # set monitor pid
+    monitor = WorkerMonitor(os.getpid(), db)
 
     try:
         # Track memory before operation

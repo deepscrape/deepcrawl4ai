@@ -4,6 +4,7 @@ import json
 import os
 import time
 import uuid
+import firebase_admin.firestore
 import psutil
 
 from redisCache import redis
@@ -81,11 +82,11 @@ class BackpressureController:
 
 # Worker Pool Management
 class WorkerMonitor:
-    def __init__(self, worker_id):
+    def __init__(self, worker_id, db=None):
         fly_machine_id = str(os.environ.get("FLY_ALLOC_ID")) or ""
         self.machine_id = f"{fly_machine_id}process:{str(worker_id)}"
 
-        # self.firestore_client = db
+        self.firestore_client = db
         self.metrics = {
             "cpu_usage": 0,
             "memory_usage": 0,
@@ -128,18 +129,18 @@ class WorkerMonitor:
         if metrics["status"] == "success":
             await self.record_operation()
 
-            # doc_ref = self.firestore_client.collection("operation_metrics").document(
-            #     operation_id
-            # )
-            # doc_ref.set(
-            #     {
-            #         "timestamp": firebase_admin.firestore.firestore.SERVER_TIMESTAMP,
-            #         "duration": metrics.get("duration"),
-            #         "memory_used": metrics.get("memory_used"),
-            #         "urls_processed": metrics.get("urls_processed"),
-            #         "machine_id": self.machine_id,
-            #     }
-            # )
+            doc_ref = self.firestore_client.collection("operation_metrics").document(
+                operation_id
+            )
+            doc_ref.set(
+                {
+                    "timestamp": firebase_admin.firestore.firestore.SERVER_TIMESTAMP,
+                    "duration": metrics.get("duration"),
+                    "memory_used": metrics.get("memory_used"),
+                    "urls_processed": metrics.get("urls_processed"),
+                    "machine_id": self.machine_id,
+                }
+            )
 
     async def record_error(self, error):
         # Record error in redis

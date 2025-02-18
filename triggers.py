@@ -1,5 +1,4 @@
 import json
-import os
 import time
 from crawl4ai import (
     AsyncWebCrawler,
@@ -45,7 +44,7 @@ async def event_stream(url):
 
         # "https://www.scrapingcourse.com/infinite-scrolling"
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await basic_crawl(
+            result: CrawlResult = await basic_crawl(
                 url=url,
                 crawler=crawler,
                 markdown_generator=markdown_generator,
