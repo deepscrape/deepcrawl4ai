@@ -1,3 +1,4 @@
+```toml
 # fly.toml app configuration file generated for deepcrawl4ai on 2025-01-16T16:53:43+02:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
@@ -17,7 +18,7 @@ internal_port = 8000
 force_https = true
 auto_stop_machines = 'stop'
 auto_start_machines = true
-min_machines_running = 0
+min_machines_running = 1
 max_machines_running = 3
 
 processes = ['app']
@@ -26,3 +27,5 @@ processes = ['app']
 memory = '1gb'
 cpu_kind = 'shared'
 cpus = 4
+
+```

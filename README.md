@@ -42,13 +42,7 @@ export UPSTASH_REDIS_REST_TOKEN=your_redis_token
 4. Run API Server:
 
 ```bash
-uvicorn api:app --reload
-```
-
-5. Run Worker:
-
-```bash
-python worker.py
+uvicorn server:app --reload
 ```
 
 ## Deployment
