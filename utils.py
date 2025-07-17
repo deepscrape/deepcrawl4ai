@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import yaml
-
+from celery.result import AsyncResult # Import AsyncResult
 from enum import Enum
 from pathlib import Path
 from typing import Dict
@@ -14,9 +14,13 @@ import crawl4ai as _c4
 
 
 class TaskStatus(str, Enum):
-    PROCESSING = "processing"
-    FAILED = "failed"
-    COMPLETED = "completed"
+    READY = "Ready"
+    STARTED = "Started"
+    SCHEDULED = "Scheduled"
+    IN_PROGRESS = "In Progress"
+    CANCELED = "Canceled"
+    COMPLETED = "Completed"
+    FAILED = "Failed"
 
 class FilterType(str, Enum):
     RAW = "raw"
@@ -107,26 +111,33 @@ def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
     return (datetime.now() - created).total_seconds() > ttl_seconds
 
 
-def decode_redis_hash(hash_data: Dict[bytes, bytes]) -> Dict[str, str]:
+def decode_redis_hash(hash_data: Dict[bytes, bytes] | Dict[str, str]) -> Dict[str, str]:
     """Decode Redis hash data from bytes to strings."""
-    return {k.decode('utf-8'): v.decode('utf-8') for k, v in hash_data.items()}
+    result = {}
+    for k, v in hash_data.items():
+        if isinstance(k, bytes):
+            k = k.decode('utf-8')
+        if isinstance(v, bytes):
+            v = v.decode('utf-8')
+        result[k] = v
+    return result
 
 
-def create_task_response(task: Dict[str, str], task_id: str, base_url: str) -> dict:
+def create_task_response(celery_task: AsyncResult, task: Dict[str, str], task_id: str, base_url: str) -> dict:
     """Create response for task status check."""
     response = {
         "task_id": task_id,
-        "status": task["status"],
+        "status": celery_task.status or task["status"],
         "created_at": task["created_at"],
         "url": task["url"],
         "_links": {
-            "self": {"href": f"{base_url}/llm/{task_id}"},
-            "refresh": {"href": f"{base_url}/llm/{task_id}"}
+            "self": {"href": f"{base_url}llm/{task_id}"},
+            "refresh": {"href": f"{base_url}llm/{task_id}"}
         }
     }
 
     if task["status"] == TaskStatus.COMPLETED:
-        response["result"] = json.loads(task["result"])
+        response["result"] = celery_task.result if celery_task.ready() else None or json.loads(task["result"])
     elif task["status"] == TaskStatus.FAILED:
         response["error"] = task["error"]
 

@@ -1,0 +1,23 @@
+graph TD
+    A[FastAPI Server] --> B[Celery];
+    B --> R[Redis Broker];
+    B --> C[Celery Worker Process];
+    C --> D[Browser Pool];
+    D --> E[Websites];
+
+    subgraph Task Flow
+        A --> F[Send Task to Celery];
+        F --> G[Return Task ID to Client];
+        C --> H[Celery Worker Polls for Tasks];
+        H --> I[Update Task Status to IN_PROGRESS];
+        I --> J[Execute Crawl Job];
+        J --> K{Periodically Check for Cancellation};
+        K -- Yes --> L[Stop Crawler & Update Status to CANCELED];
+        K -- No --> M[Update Task Status to COMPLETED/FAILED];
+    end
+
+    subgraph Cancellation Flow
+        A --> N[Client Sends Cancel Request];
+        N --> O[Revoke Task via Celery];
+        O --> P[Signal Worker to Stop Job via/Celery];
+    end

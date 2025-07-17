@@ -1,0 +1,22 @@
+graph TD
+    A[FastAPI Server] --> B{Redis Queue};
+    B --> C[Worker Process];
+    C --> D[Browser Pool or Crawler];
+    D --> E[Websites];
+
+    subgraph Task Flow
+        A --> F[Push Job to Redis Queue];
+        F --> G[Return Task ID to Client];
+        C --> H[Poll Redis Queue for Jobs];
+        H --> I[Update Task Status to IN_PROGRESS];
+        I --> J[Execute Crawl Job];
+        J --> K{Periodically Check for Cancellation};
+        K -- Yes --> L[Stop Crawler & Update Status to CANCELED];
+        K -- No --> M[Update Task Status to COMPLETED/FAILED];
+    end
+
+    subgraph Cancellation Flow
+        A --> N[Client Sends Cancel Request];
+        N --> O[Update Task Status to CANCELED in Redis];
+        O --> P[Signal Worker to Stop Job];
+    end

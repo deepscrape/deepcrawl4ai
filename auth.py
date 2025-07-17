@@ -18,7 +18,6 @@ def verify_token(
     """Verify the bearer token against environment variable."""
     
     try:
-        # expected_token = os.getenv("API_BEARER_TOKEN")
         if credentials is None:
             return None
         

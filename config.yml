@@ -39,7 +39,7 @@ redis:
 
 # Rate Limiting Configuration
 rate_limiting:
-  enabled: False
+  enabled: true
   default_limit: "1000/minute"
   trusted_proxies: []
   storage_uri: redis://${UPSTASH_REDIS_USER}:{UPSTASH_REDIS_PASS}@${UPSTASH_REDIS_REST_URL}:${UPSTASH_REDIS_PORT}  # Use "redis://localhost:6379" for production
@@ -47,7 +47,7 @@ rate_limiting:
 # Security Configuration
 security:
   enabled: true 
-  jwt_enabled: true
+  jwt_enabled: false
   https_redirect: false
   trusted_hosts: ["*"]
   headers:

@@ -3,14 +3,14 @@ import asyncio
 from asyncio.log import logger
 import logging
 from typing import Any, Callable, Dict, Optional, Union
-from urllib.parse import unquote
+
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, HttpUrl
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from upstash_redis.asyncio import Redis
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+
 from redisCache import redis
-from api import handle_crawl_job, handle_llm_request, handle_markdown_request, handle_task_status
+from api import cancel_a_job, handle_crawl_job, handle_llm_request, handle_markdown_request, handle_task_status
 from auth import get_token_dependency
 from crawl import reader
 from firestore import FirebaseClient
@@ -66,7 +66,7 @@ def init_job_router(config, socket_client: set[Any]) -> APIRouter:
 verify_token = get_token_dependency(config)
 
 
-# ---------- Genertal endpoint----------------------------------------------
+# ---------- General endpoints ----------------------------------------------
 @job_router.get("/user/data")
 async def get_user_data(
     request: Request,
@@ -109,23 +109,28 @@ async def websocket_endpoint(
     try:
         while True:
             await asyncio.sleep(1)  # Example: periodic event
-            await websocket.send_text("Hello, this is a server event!")
+            try:
+                await websocket.send_text("Hello, this is a server event!")
+            except Exception as e:
+                logger.warning(f"WebSocket send failed: {e}")
+                break
     except WebSocketDisconnect:
         _socket_client.remove(websocket)
         logger.info("WebSocket: Client disconnected")
+    finally:
+        _socket_client.discard(websocket)
+        logger.info("WebSocket: Client disconnected (cleanup)")
 
 # ---------- LL​M job ---------------------------------------------------------
 
-# @router.post("/llm/job", status_code=202)
+@job_router.post("/llm/job", status_code=202)
 async def llm_job_enqueue(
         payload: LlmJobPayload,
-        background_tasks: BackgroundTasks,
         request: Request,
         decoded_token: Dict = Depends(verify_token),   # late-bound dep
 ):
     return await handle_llm_request(
         redis,
-        background_tasks,
         request,
         str(payload.url),
         query=payload.q,
@@ -134,23 +139,21 @@ async def llm_job_enqueue(
         config=config,
     )
 
-
-# @router.get("/llm/job/{task_id}")
+@job_router.get("/llm/job/{task_id}")
 async def llm_job_status(
     request: Request,
     task_id: str,
-    # decoded_token: Dict = Depends(verify_token)
+    decoded_token: bool = Depends(verify_token)
 ):
     return await handle_task_status(redis, task_id)
 
 
-# TODO: ---------- CRAWL job -------------------------------------------------------
-
 # FIXME: this is a temporary endpoint for testing
 @job_router.post("/crawl")
 async def crawl(
-    request: Request, response: Response
-    , decoded_token: bool = Depends(verify_token)
+    request: Request, 
+    response: Response, 
+    decoded_token: bool = Depends(verify_token)
 ):
     """Reader endpoint."""
     try:
@@ -163,13 +166,17 @@ async def crawl(
         logger.warning(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@job_router.post("/crawl/md",dependencies=[Depends(verify_token)])
+@job_router.post("/crawl/md")
 async def get_markdown(
     request: Request,
     body: MarkdownRequest,
     decoded_token: bool = Depends(verify_token),
 ):
     logger.info(f"Received request: {request.method} {request.url}", )
+    
+    if not body.urls:
+            raise HTTPException(400, "At least one URL required")
+
     for url in body.urls:
         if not url.startswith(("http://", "https://")):
             raise HTTPException(
@@ -179,11 +186,10 @@ async def get_markdown(
         body.urls, body.f, body.q, body.c if body.c is not None else "0", config
     )
     return JSONResponse({
-        "urls": body.urls,
+        "results": markdowns,
         "filter": body.f,
         "query": body.q,
         "cache": body.c,
-        "markdowns": markdowns,
         "server_processing_time_s": server_processing_time_s,
         "server_memory_delta_mb": server_memory_delta_mb,
         "server_peak_memory_mb": server_peak_memory_mb,
@@ -191,24 +197,29 @@ async def get_markdown(
     })
 
 
-# @router.post("/crawl/job", status_code=202)
+@job_router.post("/crawl/job", status_code=202)
 async def crawl_job_enqueue(
         request: Request,
         payload: CrawlJobPayload,
-        background_tasks: BackgroundTasks,
-        # decoded_token: bool = Depends(verify_token),
+        decoded_token: bool = Depends(verify_token)
 ):
     return await handle_crawl_job(
         redis,
-        background_tasks,
         [str(u) for u in payload.urls],
         payload.browser_config,
         payload.crawler_config,
         config=config or {},
     )
+@job_router.post("/crawl/job/cancel/{task_id}")
+async def crawl_job_cancel(
+    request: Request,
+    task_id: str,
+    decoded_token: Dict = Depends(verify_token)
+):
+    """Cancel a running crawl job."""
+    return await cancel_a_job(redis, task_id)
 
-
-# @router.get("/crawl/job/{task_id}")
+@job_router.get("/crawl/job/{task_id}")
 async def crawl_job_status(
     request: Request,
     task_id: str,
@@ -233,3 +244,29 @@ async def stream(request: Request,
         # Handle other exceptions
         logger.warning(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+""" @app.post("/crawl/stream")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def crawl_stream(
+    request: Request,
+    crawl_request: CrawlRequest,
+    _td: Dict = Depends(token_dep),
+):
+    if not crawl_request.urls:
+        raise HTTPException(400, "At least one URL required")
+    crawler, gen = await handle_stream_crawl_request(
+        urls=crawl_request.urls,
+        browser_config=crawl_request.browser_config,
+        crawler_config=crawl_request.crawler_config,
+        config=config,
+    )
+    return StreamingResponse(
+        stream_results(crawler, gen),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Stream-Status": "active",
+        },
+    )
+ """

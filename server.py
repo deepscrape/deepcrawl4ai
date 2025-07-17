@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Callable, Dict
+from typing import Any, Callable
 
 # from typing import Annotated  # noqa: F401
 from crawl4ai import AsyncWebCrawler, BrowserConfig
@@ -16,10 +16,8 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Request,
-    WebSocket,
-    WebSocketDisconnect,
 )
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
@@ -28,11 +26,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from upstash_ratelimit.asyncio import Ratelimit
-from firestore import FirebaseClient
 
 
 from utils import periodic_client_cleanup
-from redisCache import redis, default_limiter
+from redisCache import default_limiter, test_connection, redis
 from crawler_pool import close_all, get_crawler, janitor
 import uvicorn
 
@@ -93,6 +90,7 @@ async def lifespan(_: FastAPI):
             extra_args=config["crawler"]["browser"].get("extra_args", []),
             **config["crawler"]["browser"].get("kwargs", {}),
         ))           # warm‑up
+        await test_connection(redis) # Moved from on_event("startup")
         app.state.janitor = asyncio.create_task(janitor())        # idle GC
         app.state.websocket = asyncio.create_task(periodic_client_cleanup(socket_client))
         yield
@@ -202,7 +200,6 @@ if config["observability"]["prometheus"]["enabled"]:
 
 # Set the token dependency for token verification, jwt if enabled from config file
 verify_token = get_token_dependency(config)
-
 
 # ───────────────────── FastAPI middlewares ──────────────────────
 

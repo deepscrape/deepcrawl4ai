@@ -20,6 +20,8 @@ redis = Redis(
     token=redis_token,
 )
 
+
+
 async def test_connection(redis: Redis):
     try:
         await redis.ping()
@@ -46,4 +48,4 @@ custom_limiter = Ratelimit(
 )
 
 # ─────────────────── asyncio test  ──────────────────
-asyncio.run(test_connection(redis))
+# asyncio.run(test_connection(redis))

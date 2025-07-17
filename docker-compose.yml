@@ -3,13 +3,23 @@ version: "3.8"
 services:
   api:
     build: .
+    container_name: deepcrawl4ai-api
+    command: >
+      gunicorn -k uvicorn.workers.UvicornWorker server:app
+      --bind 0.0.0.0:8000
+      --workers 1
+      --threads 4
+      --graceful-timeout 30
+      --keep-alive 300
+      --timeout 1800
+      --log-level info
     ports:
       - "8000:8000"
     environment:
       - UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL}
       - UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN}
-    depends_on:
-      - redis
+      - UPSTASH_REDIS_PASS = ${UPSTASH_REDIS_PASS}
+      - PYTHON_ENV=production
 
   worker:
     build: .
@@ -17,10 +27,10 @@ services:
     environment:
       - UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL}
       - UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN}
-    depends_on:
-      - redis
+  #   depends_on:
+  #     - redis
 
-  redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
+  # redis:
+  #   image: redis:alpine
+  #   ports:
+  #     - "6379:6379"

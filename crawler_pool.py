@@ -22,19 +22,20 @@ def _sig(cfg: BrowserConfig) -> str:
     payload = json.dumps(cfg.to_dict(), sort_keys=True, separators=(",",":"))
     return hashlib.sha1(payload.encode()).hexdigest()
 
-async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
+async def get_crawler(cfg: BrowserConfig) -> tuple[AsyncWebCrawler, str]:
+    
     try:
         sig = _sig(cfg)
         async with LOCK:
             if sig in POOL:
                 LAST_USED[sig] = time.time();  
-                return POOL[sig]
+                return POOL[sig], sig
             if psutil.virtual_memory().percent >= MEM_LIMIT:
                 raise MemoryError("RAM pressure – new browser denied")
             crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
             await crawler.start()
             POOL[sig] = crawler; LAST_USED[sig] = time.time()
-            return crawler
+            return crawler, sig
     except MemoryError as e:
         raise MemoryError(f"RAM pressure – new browser denied: {e}")
     except Exception as e:
@@ -46,7 +47,17 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             # If we failed to start the browser, we should remove it from the pool
             POOL.pop(sig, None)
             LAST_USED.pop(sig, None)
-        # If we failed to start the browser, we should remove it from the pool
+
+async def cancel_crawler(sign: str):
+    async with LOCK:
+        if sign in POOL:
+            crawler = POOL[sign]
+            with suppress(Exception): await crawler.close()  # Close the crawler
+            POOL.pop(sign, None)  # Remove from pool
+            LAST_USED.pop(sign, None)  # Remove from last used
+            return True
+    return False
+
 async def close_all():
     async with LOCK:
         await asyncio.gather(*(c.close() for c in POOL.values()), return_exceptions=True)
