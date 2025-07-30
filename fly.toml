@@ -1,55 +1,70 @@
-# fly.toml app configuration file generated for deepcrawl4ai on 2025-07-15T20:45:27+03:00
+# fly.toml app configuration file generated for crawlagent on 2025-07-15T20:45:27+03:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'deepcrawl4ai'
+app = 'crawlagent'
 primary_region = 'fra'
 
 [build]
-  dockerfile = 'Dockerfile'
 
 [env]
   UPSTASH_REDIS_PORT = '30766'
   UPSTASH_REDIS_REST_URL = 'https://gusc1-saved-terrapin-30766.upstash.io'
 
-[http_service]
+[[services]]
+  protocol = 'tcp'
   internal_port = 8000
-  force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
-  max_machines_running = 3
   processes = ['app']
 
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+    force_https = true
 
-# [[services]]
-#   protocol = 'tcp'
-#   internal_port = 8000
-#   auto_stop_machines = 'stop'
-#   auto_start_machines = true
-#   min_machines_running = 0
-#   processes = ['app']
+  [[services.ports]]
+    port = 443
+    handlers = ['tls', 'http']
 
-#   [[services.ports]]
-#     port = 80
-#     handlers = ['http']
-#     force_https = true
+  [services.concurrency]
+    type = 'connections'
+    hard_limit = 25
+    soft_limit = 20
 
-#   [[services.ports]]
-#     port = 443
-#     handlers = ['tls', 'http']
+[[services]]
+  internal_port = 9222
+  protocol = "tcp"
+  processes = ["app", "worker"]
 
-#   [services.concurrency]
-#     type = 'connections'
-#     hard_limit = 25
-#     soft_limit = 20
+  [[services.ports]]
+    port = 9222
+    handlers = ["http"]
+
+[[services]]
+  internal_port = 6080
+  protocol = "tcp"
+  processes = ["app","worker"]
+  [[services.ports]]
+    port = 6080
+    handlers = ["tls", "http"]  # Ensure "tls" is included for HTTPS
+
+[processes]
+  app = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & /opt/noVNC/utils/websockify/run 6080 localhost:5900 --web /opt/noVNC & uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
+  worker = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & celery -A celery_app.celery_app worker --loglevel=info'"
+  # app = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
+  # worker = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && celery -A celery_app.celery_app worker --loglevel=info --concurrency=2'"
+  # app = "uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"
+  # worker = "celery -A celery_app.celery_app worker --loglevel=info --concurrency=2"
 
 [[vm]]
-  memory = '1gb'
+  memory = '2gb'
   cpu_kind = 'shared'
   cpus = 4
 
 [[metrics]]
   port = 8000
   path = '/metrics'
+  https = false

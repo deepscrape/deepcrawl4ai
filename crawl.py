@@ -13,6 +13,7 @@ from crawl4ai import (
     PruningContentFilter,
 )
 from fastapi import Request, Response
+from fastapi.responses import StreamingResponse
 import psutil
 from functools import partial
 from aiomultiprocess import Pool
@@ -117,7 +118,15 @@ async def reader(request: Request, response: Response) -> Response:
                 ):
                     response.body = await arrayBuffer_basic_crawl(url)
                 elif response_config["Content-Type"] == "text/event-stream":
-                    response.body = await event_stream(url)
+                    return StreamingResponse(
+                            event_stream(url),
+                            media_type="application/x-ndjson",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Stream-Status": "active",
+                            },
+                        )
 
                 return response
 

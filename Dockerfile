@@ -1,5 +1,5 @@
 # Use an official Python runtime as a base image
-FROM python:3.12-slim-bookworm AS build
+FROM python:3.10-slim AS build
 
 # Set environment variables to production
 ENV PYTHONFAULTHANDLER=1 \
@@ -54,8 +54,13 @@ RUN apt-get update -y && \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libgtk-3-0 \
-    curl fonts-liberation ca-certificates && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    xvfb \
+    x11vnc \
+    git \
+    curl fonts-liberation ca-certificates lsof \
+    && git clone https://github.com/novnc/noVNC /opt/noVNC \
+    && git clone https://github.com/novnc/websockify /opt/noVNC/utils/websockify \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # RUN apt-get update && apt-get dist-upgrade -y \
 #     && rm -rf /var/lib/apt/lists/*
@@ -100,7 +105,6 @@ WORKDIR ${APP_HOME}
 
 COPY requirements.txt .
 COPY config.yml .
-COPY .env .
 
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir playwright
@@ -136,10 +140,11 @@ COPY . .
 # RUN playwright install chromium
 
 # Expose the port your FastAPI app will run on
-EXPOSE 8000
+EXPOSE 8000 9222 6080
 
 # Command to run the application
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
-
+# CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--ws", "websockets"]
+# CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"]
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & /opt/noVNC/utils/websockify/run 6080 localhost:5900 --web /opt/noVNC & uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"]
 # Start the application using supervisord
 # CMD ["supervisord", "-c", "supervisord.conf"]

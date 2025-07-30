@@ -5,7 +5,7 @@ import logging
 import os
 from functools import partial # Import partial
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlResult, CrawlerRunConfig, DefaultMarkdownGenerator, LLMConfig, LLMContentFilter, LLMExtractionStrategy, LXMLWebScrapingStrategy, MemoryAdaptiveDispatcher, PruningContentFilter, RateLimiter
@@ -14,11 +14,11 @@ from fastapi import HTTPException, status
 import psutil
 
 
-from redisCache import redis
+from redisCache import REDIS_CHANNEL, redis, pure_redis
 
 from celery_app import celery_app
 from celery.exceptions import SoftTimeLimitExceeded
-from utils import FilterType, TaskStatus, decode_redis_hash, is_task_id, setup_logging, should_cleanup_task, load_config
+from utils import FilterType, TaskStatus, _get_memory_mb, datetime_handler, decode_redis_hash, is_task_id, setup_logging, should_cleanup_task, load_config, stream_pubsub_results
 from crawler_pool import get_crawler, cancel_crawler
 
 config = load_config()
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 def crawl_task(self, urls: List[str], browser_config: Dict, crawler_config: Dict) :
     """Celery task to handle crawl requests."""
     import asyncio
-    logger.info(f"Starting crawl task with URLs: {urls}")
+    logger.info("Starting crawl task with URLs")
     # logger.info(f"Browser config: {browser_config}")
     # logger.info(f"Crawler config: {crawler_config}")
 
@@ -123,16 +123,28 @@ async def llm_extraction_task(self, url: str, instruction: str, schema: Optional
         })
         raise
 
+@celery_app.task(bind=True)
+def crawl_stream_task(self, urls: List[str], browser_config: Dict, crawler_config: Dict) -> Dict:
+    """Celery task to process LLM crawl stream."""
+
+    try:
+        
+        asyncio.get_event_loop().run_until_complete(_crawl_stream_task_impl(self, urls, browser_config, crawler_config))
+        return {"status": TaskStatus.COMPLETED, "message": "crawl stream task completed successfully."}
+    
+    except Exception as e:
+        logger.error(f"Error in LLM crawl stream task: {e}")
+        return {"status": TaskStatus.FAILED, "message": str(e)}
 
 async def _crawl_task_impl(self, urls: List[str], browser_config: Dict, crawler_config: Dict):
     """Internal implementation of the crawl task."""
     task_id = self.request.id
     logger.info(f"Celery task {task_id} started.")
-    
-    browser = BrowserConfig.load(browser_config)
-    crawler, sign = await get_crawler(browser) # get_crawler returns crawler and signature
+    sign = "no_signature"
     
     try:
+        browser = BrowserConfig.load(browser_config)
+        crawler, sign = await get_crawler(browser) # get_crawler returns crawler and signature
         # Check for cancellation
         # if self.request.aborted:
         #     await redis.hset(f"task:{task_id}", values={"status": TaskStatus.CANCELED})
@@ -151,7 +163,7 @@ async def _crawl_task_impl(self, urls: List[str], browser_config: Dict, crawler_
 
         crawled = {
             "success": True,
-            "results": "",
+            "results": results,
             "server_processing_time_s": total_time,
             "server_memory_delta_mb": mem_delta_mb,
             "server_peak_memory_mb": peak_mem_mb
@@ -235,7 +247,9 @@ async def handle_crawl_request(
             peak_mem_mb = max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb) # <--- Get peak memory
             logger.info(f"Memory usage: Start: {start_mem_mb} MB, End: {end_mem_mb} MB, Delta: {mem_delta_mb} MB, Peak: {peak_mem_mb} MB, Total Time: {total_time}" )
                               
-        return results, total_time, mem_delta_mb, peak_mem_mb
+        return [{"url": url, 
+              "dump": result.model_dump() if hasattr(result, 'model_dump') else "No model_dump available",
+             } for url, result in zip(urls, results)], total_time, mem_delta_mb, peak_mem_mb
 
     except Exception as e:
         logger.error(f"Crawl error: {str(e)}", exc_info=True)
@@ -259,10 +273,194 @@ async def handle_crawl_request(
             })
         )
 
-# --- Helper to get memory ---
-def _get_memory_mb():
+
+async def _crawl_stream_task_impl(
+    self,
+    urls: List[str],
+    browser_config: dict,
+    crawler_config: dict,
+):
+    """Handle streaming crawl requests."""
+
+
+    task_id = self.request.id
+    logger.info(f"Celery task {task_id} started.")
+    sign = "no_signature"
+
     try:
-        return psutil.Process().memory_info().rss / (1024 * 1024)
+        browser = BrowserConfig.load(browser_config)
+        crawler, sign = await get_crawler(browser) # get_crawler returns crawler and signature
+
+        await redis.hset(f"task:{task_id}", values={
+            "signature": sign if sign else "no_signature"  # Store signature if available
+        })
+
+        results = await handle_stream_crawl_request(
+            urls=urls,
+            crawler=crawler,
+            browser_config=browser_config,
+            crawler_config=crawler_config,
+            config=config,
+        )
+
+        # Stream results to Redis Pub/Sub
+        channel = f"{REDIS_CHANNEL}:{task_id}"
+        model_dump_list = await stream_pubsub_results(pure_redis, channel, results)
+        
+
+        await redis.hset(f"task:{task_id}", values={
+            "signature": sign if sign else "no_signature",  # Store signature if available
+            "status": TaskStatus.COMPLETED,
+            "result": json.dumps(model_dump_list, default=datetime_handler),  # Ensure result is a string
+            "update_at": datetime.utcnow().isoformat()  # Store update time
+            # "server_processing_time_s": total_time,
+            # "server_memory_delta_mb": mem_delta_mb,
+            # "server_peak_memory_mb": peak_mem_mb
+        })
+
+        
+        await cancel_crawler(sign)  # Remove the crawler to free resources
+
+        await asyncio.sleep(5)  # Give Redis time to process the update
+
+        # return {"success": True, "results": crawled}
+
     except Exception as e:
-        logger.warning(f"Could not get memory info: {e}")
-        return None
+        logger.error(f"Celery crawl task error: {str(e)}", exc_info=True)
+        await redis.hset(f"task:{task_id}", values={
+            "status": TaskStatus.FAILED,
+            "error": str(e),
+        })
+        await cancel_crawler(sign)  # Remove the crawler to free resources
+        raise
+
+""" async def handle_stream_crawl_request(
+    urls: List[str],
+    crawler: AsyncWebCrawler,
+    crawler_config: dict,
+    config: dict
+) -> tuple[AsyncGenerator, float, Optional[float], Optional[float]]:
+    Handle non-streaming crawl requests
+    start_mem_mb = _get_memory_mb() # <--- Get memory before
+    start_time = time.time()
+    mem_delta_mb = None
+    peak_mem_mb = start_mem_mb
+    try:
+        urls = [('https://' + url) if not url.startswith(('http://', 'https://')) else url for url in urls]
+
+        crawler_conf = CrawlerRunConfig.load(crawler_config)
+
+        dispatcher = MemoryAdaptiveDispatcher(
+            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            rate_limiter=RateLimiter(
+                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+            ) if config["crawler"]["rate_limiter"]["enabled"] else None
+        )
+        
+
+        base_config = config["crawler"]["base_config"]
+        # Iterate on key-value pairs in global_config then use haseattr to set them 
+        for key, value in base_config.items():
+            if hasattr(crawler_conf, key):
+                setattr(crawler_conf, key, value)
+
+        
+        func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
+        partial_func = partial(func, 
+                                urls[0] if len(urls) == 1 else urls, 
+                                config=crawler_conf, 
+                                dispatcher=dispatcher)
+        
+        results = await partial_func()
+
+        # await crawler.close()
+        
+        end_mem_mb = _get_memory_mb() # <--- Get memory after
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        if start_mem_mb is not None and end_mem_mb is not None:
+            mem_delta_mb = end_mem_mb - start_mem_mb # <--- Calculate delta
+            peak_mem_mb = max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb) # <--- Get peak memory
+            logger.info(f"Memory usage: Start: {start_mem_mb} MB, End: {end_mem_mb} MB, Delta: {mem_delta_mb} MB, Peak: {peak_mem_mb} MB, Total Time: {total_time}" )
+                              
+        # return [{"url": url, 
+        #       "dump": result.model_dump() if hasattr(result, 'model_dump') else "No model_dump available",
+        #      } for url, result in zip(urls, results)], total_time, mem_delta_mb, peak_mem_mb
+        return results, total_time, mem_delta_mb, peak_mem_mb
+
+    except Exception as e:
+        logger.error(f"Crawl error: {str(e)}", exc_info=True)
+        if 'crawler' in locals() and crawler.ready: # Check if crawler was initialized and started
+             try:
+                 await crawler.close()
+             except Exception as e:
+                  logger.error(f"Error closing crawler during exception handling: {str(e)}")
+            
+        # Measure memory even on error if possible
+        end_mem_mb_error = _get_memory_mb()
+        if start_mem_mb is not None and end_mem_mb_error is not None:
+            mem_delta_mb = end_mem_mb_error - start_mem_mb
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=json.dumps({ # Send structured error
+                "error": str(e),
+                "server_memory_delta_mb": mem_delta_mb,
+                "server_peak_memory_mb": max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb_error or 0)
+            })
+        ) """
+
+
+async def handle_stream_crawl_request(
+    urls: List[str],
+    crawler:AsyncWebCrawler,
+    browser_config: dict,
+    crawler_config: dict,
+    config: dict
+) -> Tuple[AsyncWebCrawler, AsyncGenerator]:
+    """Handle streaming crawl requests."""
+    try:
+        browser_config = BrowserConfig.load(browser_config)
+        # browser_config.verbose = True # Set to False or remove for production stress testing
+        browser_config.verbose = False
+        crawler_config = CrawlerRunConfig.load(crawler_config)
+        crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
+        # crawler_config.stream = True
+
+        dispatcher = MemoryAdaptiveDispatcher(
+            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            rate_limiter=RateLimiter(
+                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+            )
+        )
+
+        # crawler = AsyncWebCrawler(config=browser_config)
+        # await crawler.start()
+        base_config = config["crawler"]["base_config"]
+        # Iterate on key-value pairs in global_config then use haseattr to set them 
+        for key, value in base_config.items():
+            if hasattr(crawler_config, key):
+                setattr(crawler_config, key, value)
+
+        results_gen = await crawler.arun_many(
+            urls=urls,
+            config=crawler_config,
+            dispatcher=dispatcher
+        )
+
+        return results_gen
+
+    except Exception as e:
+        # Make sure to close crawler if started during an error here
+        if 'crawler' in locals() and crawler.ready:
+            logger.error(f"Error closing crawler during stream setup exception: {str(e)}")
+
+        logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
+
+        # Raising HTTPException here will prevent streaming response
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+   

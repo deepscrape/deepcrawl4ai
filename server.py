@@ -39,7 +39,7 @@ from auth import get_token_dependency
 
 # Use uvloop for enhanced performance
 from utils import load_config, setup_logging
-from job import init_job_router, job_router
+from job import init_job_router
 
 # ── internal imports (after sys.path append) ─────────────────
 # sys.path.append(os.path.dirname(os.path.realpath(__file__)))
@@ -47,7 +47,11 @@ from job import init_job_router, job_router
 # Add parent directory to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
+
+####################################################################
 # ────────────────── configuration / logging ──────────────────
+####################################################################
+
 config = load_config()
 setup_logging(config)
 logger = logging.getLogger(__name__)
@@ -82,7 +86,11 @@ else:
     asyncio.set_event_loop_policy(EventLoopPolicy())
     # logger.warning("uvloop is not supported on Windows, using default(auto) event loop")
 
+###############################################################
 # ───────────────────── FastAPI lifespan ──────────────────────
+###############################################################
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
@@ -104,14 +112,25 @@ async def lifespan(_: FastAPI):
             app.state.websocket.cancel()
         await close_all()
 
-# Initialize FastAPI app on_startup=[startup_event], on_shutdown=[shutdown_event]
+
+####################################################################
 # ───────────────────── FastAPI instance ──────────────────────
+###############################################################
+
+# Initialize FastAPI app on_startup=[startup_event], on_shutdown=[shutdown_event]
+
 app = FastAPI(
     title=config["app"]["title"],
     version=config["app"]["version"],
     lifespan=lifespan,
 )
+
+
+####################################################################
 # ───────────────────── FastAPI Rate Limiting ──────────────────────
+####################################################################
+
+
 # # Initialize rate limiter
 # limiter = Limiter(
 #     key_func=get_remote_address,
@@ -178,7 +197,11 @@ def rate_limited(
             return await func(*args, **kwargs)
         return wrapper
     return decorator
+
+
+################################################################
 # ───────────────────── FastAPI Security ───────────────────────
+################################################################
 
 def _setup_security(app_: FastAPI):
     sec = config["security"]
@@ -201,7 +224,9 @@ if config["observability"]["prometheus"]["enabled"]:
 # Set the token dependency for token verification, jwt if enabled from config file
 verify_token = get_token_dependency(config)
 
+################################################################
 # ───────────────────── FastAPI middlewares ──────────────────────
+################################################################
 
 # security headers middleware
 @app.middleware("http")
@@ -215,7 +240,7 @@ async def add_security_headers(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     # Define routes to exclude from rate limiting
-    excluded_paths = ["/health", "/status"]
+    excluded_paths = ["/health", "/status", "/metrics"]
 
     if request.url.path in excluded_paths:
         return await call_next(request)
@@ -271,7 +296,10 @@ app.add_middleware(GZipMiddleware, minimum_size=config["app"].get("minimum_size"
 # redis = aioredis.from_url(config["redis"].get("uri", "redis://localhost"))
 
 
+################################################################
 # ───────────────────── FastAPI routes ───────────────────────
+################################################################
+
 
 # ── job router ────────────────────────────────────────────── init_job_router(redis, config, verify_token, socket_client)
 app.include_router(router=init_job_router(config, socket_client))
@@ -294,8 +322,10 @@ async def health():
 async def metrics():
     return RedirectResponse(config["observability"]["prometheus"]["endpoint"])
 
-
+################################################################
 # ────────────────────────── cli ──────────────────────────────
+################################################################
+
 if __name__ == "__main__":
     import uvicorn
     # if sys.platform == "win32":

@@ -1,10 +1,10 @@
 ```toml
-# fly.toml app configuration file generated for deepcrawl4ai on 2025-01-16T16:53:43+02:00
+# fly.toml app configuration file generated for crawlagent on 2025-01-16T16:53:43+02:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'deepcrawl4ai'
+app = 'crawlagent'
 primary_region = 'fra'
 
 [build]

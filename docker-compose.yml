@@ -3,7 +3,7 @@ version: "3.8"
 services:
   api:
     build: .
-    container_name: deepcrawl4ai-api
+    container_name: crawlagent-api
     command: >
       gunicorn -k uvicorn.workers.UvicornWorker server:app
       --bind 0.0.0.0:8000

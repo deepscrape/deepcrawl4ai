@@ -14,7 +14,7 @@ from functools import partial
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 from uuid import uuid4
 from courlan import get_base_url
@@ -31,20 +31,12 @@ from celery.result import AsyncResult # Import AsyncResult
 from upstash_redis.asyncio import Redis
 
 from crawler_pool import cancel_crawler
-from utils import FilterType, TaskStatus, create_task_response, decode_redis_hash, is_task_id, should_cleanup_task
+from utils import FilterType, TaskStatus, _get_memory_mb, create_task_response, decode_redis_hash, is_task_id, should_cleanup_task
 from celery_app import celery_app # Import celery_app
-from tasks import crawl_task, llm_extraction_task # Import Celery tasks
+from tasks import crawl_stream_task, crawl_task, llm_extraction_task # Import Celery tasks
 
 logger = logging.getLogger(__name__)
 
-
-# --- Helper to get memory ---
-def _get_memory_mb():
-    try:
-        return psutil.Process().memory_info().rss / (1024 * 1024)
-    except Exception as e:
-        logger.warning(f"Could not get memory info: {e}")
-        return None
     
 
 # class ScrapingOperation(BaseModel):
@@ -190,7 +182,8 @@ async def handle_markdown_request(
     filter_type: FilterType,
     query: Optional[str] = None,
     cache: str = "0",
-    config: Optional[dict] = None 
+    config: Optional[dict] = None,
+    browser_config: Optional[Dict] = None
 ) -> tuple[list[dict], float | None, Any | None, Any | int | None]:
     """Handle markdown generation requests."""
     start_mem_mb = _get_memory_mb() # <--- Get memory before
@@ -231,22 +224,25 @@ async def handle_markdown_request(
             ) if safe_config["crawler"]["rate_limiter"]["enabled"] else None
         )
         
+        if browser_config is not None:
+            browser = BrowserConfig.load(browser_config)
+        else:
+            browser = BrowserConfig(
+                headless=True,
+                extra_args=[
+                "--disable-gpu",  # Disable GPU acceleration
+                "--disable-dev-shm-usage",  # Disable /dev/shm usage
+                "--no-sandbox",  # Required for Docker
+                ],
+                viewport={
+                    "width": 800,
+                    "height": 600,
+                },  # Smaller viewport for better performance
+            )
 
-        browser_config = BrowserConfig(
-            headless=True,
-            extra_args=[
-            "--disable-gpu",  # Disable GPU acceleration
-            "--disable-dev-shm-usage",  # Disable /dev/shm usage
-            "--no-sandbox",  # Required for Docker
-            ],
-            viewport={
-                "width": 800,
-                "height": 600,
-            },  # Smaller viewport for better performance
-        )
         # Initialize the crawler
         from crawler_pool import get_crawler
-        crawler, _ = await get_crawler(browser_config) # Unpack the tuple
+        crawler, _ = await get_crawler(browser) # Unpack the tuple
         
         results = []
         func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
@@ -308,6 +304,57 @@ async def handle_markdown_request(
             })
         )
 
+async def handle_stream_crawl_request(
+    urls: List[str],
+    browser_config: dict,
+    crawler_config: dict,
+    config: dict
+) -> Tuple[AsyncWebCrawler, AsyncGenerator]:
+    """Handle streaming crawl requests."""
+    try:
+        browser_config = BrowserConfig.load(browser_config)
+        # browser_config.verbose = True # Set to False or remove for production stress testing
+        browser_config.verbose = False
+        crawler_config = CrawlerRunConfig.load(crawler_config)
+        crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
+        crawler_config.stream = True
+
+        dispatcher = MemoryAdaptiveDispatcher(
+            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            rate_limiter=RateLimiter(
+                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+            )
+        )
+
+        from crawler_pool import get_crawler
+        bcrawler:tuple[AsyncWebCrawler, str] = await get_crawler(browser_config)
+        crawler, _ = bcrawler
+        # crawler = AsyncWebCrawler(config=browser_config)
+        # await crawler.start()
+
+        results_gen = await crawler.arun_many(
+            urls=urls,
+            config=crawler_config,
+            dispatcher=dispatcher
+        )
+
+        return crawler, results_gen
+
+    except Exception as e:
+        # Make sure to close crawler if started during an error here
+        if 'crawler' in locals() and crawler.ready:
+            #  try:
+            #       await crawler.close()
+            #  except Exception as close_e:
+            #       logger.error(f"Error closing crawler during stream setup exception: {close_e}")
+            logger.error(f"Error closing crawler during stream setup exception: {str(e)}")
+        logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
+        # Raising HTTPException here will prevent streaming response
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    
 async def handle_crawl_job(
     redis: Redis,
     urls: List[str],
@@ -337,10 +384,54 @@ async def handle_crawl_job(
     })
     return {"task_id": task_id}
 
+async def handle_crawl_stream_job(
+        redis: Redis,
+        base_url: str,
+        urls: List[str],
+        browser_config: Dict,
+        crawler_config: Dict,
+        config: Dict,
+) -> JSONResponse:
+    
+    """ Fire-and-forget version of handle_stream_crawl_request.
+    Creates a task in Redis, runs the heavy work in a background task and publish to redis pub/sub,
+    lets /crawl/job/{task_id} polling fetch the result by websockets """
 
-async def cancel_a_job(redis: Redis, task_id: str):
+    logger.info(f"Enqueuing a streaming crawl job for URLs: {urls}")
+    # print crawler_config
+    logger.info(f"Crawler config: {crawler_config}")
+
+    # Enqueue the task to Celery
+    task = crawl_stream_task.delay(urls, browser_config, crawler_config)
+    task_id = task.id
+
+
+    # Store initial task details in Redis, signature will be updated by worker
+    await redis.hset(f"task:{task_id}", values={
+        "status": TaskStatus.IN_PROGRESS.value, # Convert Enum to string
+        "created_at": datetime.utcnow().isoformat(),
+        "urls": json.dumps(urls),
+        "result": "",
+        "error": "",
+    })
+
+    return JSONResponse({
+        "task_id": task_id,
+        "status": TaskStatus.IN_PROGRESS.value, # Convert Enum to string
+        "_links": {
+            "self": {"href": f"{base_url}crawl/stream/job/{task_id}"},
+            "status": {"href": f"{base_url}crawl/stream/job/{task_id}"}
+        }
+    })
+
+
+
+async def cancel_a_job(redis: Redis, task_id: str, force: bool = False):
+
     """Cancel a running crawl job using Celery's revocation."""
+    
     task_info = await redis.hgetall(f"task:{task_id}")
+
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -354,7 +445,7 @@ async def cancel_a_job(redis: Redis, task_id: str):
         celery_app.control.revoke(
             task_id,
             terminate=True,
-            signal=signal.SIGILL if os.name == 'posix' else signal.SIGTERM
+            signal=signal.SIGKILL if force else signal.SIGTERM if os.name == 'posix' else signal.SIGTERM
         )
         
 
@@ -426,5 +517,7 @@ async def create_new_task(
             "status": {"href": f"{base_url}llm/{task_id}"}
         }
     })
+
+
 
 # process_llm_extraction is now a Celery task in tasks.py, so it's removed from here.

@@ -1,5 +1,8 @@
-from crawl4ai import AsyncWebCrawler, CacheMode, CrawlResult
+import os
+from crawl4ai import AsyncWebCrawler, CacheMode, CrawlResult, CrawlerMonitor, ExtractionStrategy, LLMConfig, LLMExtractionStrategy, LXMLWebScrapingStrategy, MemoryAdaptiveDispatcher, RateLimiter
 from crawl4ai.async_configs import CrawlerRunConfig
+from pydantic import BaseModel, Field
+
 
 
 async def infinite_scroll(
@@ -217,7 +220,8 @@ async def basic_crawl(
     markdown_generator,
     url="https://www.scrapingcourse.com/button-click",
     session_id="hn_session",
-    llm_strategy=None,
+    llm_strategy = None,
+    stream: bool = False,
 ):
     # wait_condition = """js:() => {
     #     const isButton = document.querySelector('button.fc-button.fc-confirm-choices.fc-primary-button');
@@ -227,6 +231,8 @@ async def basic_crawl(
 
     # Step 1: Load initial commits
     next_config = CrawlerRunConfig(
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        stream=stream,  # Enable streaming
         # wait_for=wait_condition,
         session_id=session_id,
         cache_mode=CacheMode.BYPASS,
@@ -239,7 +245,15 @@ async def basic_crawl(
         # override_navigator=True,  # Override navigator properties
         exclude_external_links=True,
         exclude_social_media_links=True,
-        extraction_strategy=llm_strategy,
+        extraction_strategy=llm_strategy
+    )
+
+    dispatcher = MemoryAdaptiveDispatcher(
+        memory_threshold_percent=70.0,
+        check_interval=1.0,
+        max_session_permit=10,  # Maximum concurrent tasks
+        rate_limiter=RateLimiter(base_delay=(0.5, 1.0), max_delay=10.0),
+        monitor=CrawlerMonitor(enable_ui=True),
     )
 
     result2 = await crawler.arun(url=url, config=next_config)
@@ -277,3 +291,80 @@ async def basic_crawl(
     # )   # Default crawl run configuration
 
     return result2
+
+async def basic_stream_crawl(
+    crawler: AsyncWebCrawler,
+    markdown_generator,
+    url="https://www.scrapingcourse.com/button-click",
+    session_id="hn_session",
+    llm_strategy = None,
+    stream: bool = False,
+):
+    # wait_condition = """js:() => {
+    #     const isButton = document.querySelector('button.fc-button.fc-confirm-choices.fc-primary-button');
+    #     isButton?.click();
+    #     return isButton !== null;
+    # }"""
+
+    # Step 1: Load initial commits
+    next_config = CrawlerRunConfig(
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        stream=stream,  # Enable streaming
+        # wait_for=wait_condition,
+        session_id=session_id,
+        cache_mode=CacheMode.BYPASS,
+        magic=True,  # Enable magic mode
+        markdown_generator=markdown_generator,
+        # wait_for_images=True,  # Add this argument to ensure images are fully loaded
+        # process_iframes=True, # Extract iframe content
+        # remove_overlay_elements=True,  # Remove popups/modals that might block iframe
+        # simulate_user=True, # Simulate human behavior
+        # override_navigator=True,  # Override navigator properties
+        exclude_external_links=True,
+        exclude_social_media_links=True,
+        extraction_strategy=llm_strategy
+    )
+
+    dispatcher = MemoryAdaptiveDispatcher(
+        memory_threshold_percent=70.0,
+        check_interval=1.0,
+        max_session_permit=10,  # Maximum concurrent tasks
+        rate_limiter=RateLimiter(base_delay=(0.5, 1.0), max_delay=10.0),
+        monitor=CrawlerMonitor(enable_ui=True),
+    )
+
+    result2 = await crawler.arun(url=url, config=next_config)
+    
+    # config_next1 = CrawlerRunConfig(
+    #     session_id=session_id,
+    #     js_only=True,       # We're continuing from the open tab
+    #     cache_mode=CacheMode.BYPASS,
+    #     markdown_generator=markdown_generator,    #
+    #     # scan_full_page=True,   # Enables scrolling
+    #     # scroll_delay=2, # Waits 200ms between scrolls (optional)
+    # )
+
+    # await crawler.arun(
+    #     url=url,
+    #     config=config_next1
+    # )
+    # run_config = CrawlerRunConfig(
+    #     # wait_for=f"css:{bg_images}",
+    #     session_id=session_id,
+    #     wait_for=f"js:{wait_condition}",
+    #     # wait_for_images=True,  # Add this argument to ensure images are fully loaded
+    #     # process_iframes=True,  # Process iframes
+    #     # remove_overlay_elements=True,  # Remove popups/modals that might block iframe
+    #     # js_code=js_commands, # where js_code is the previous code content
+    #     # magic=True,  # Enable magic mode
+    #     scan_full_page=True,   # Enables scrolling
+    #     scroll_delay=2, # Waits 200ms between scrolls (optional)
+    #     # Mark that we do not re-navigate, but run JS in the same session:
+    #     js_only=True,
+    #     # cache_mode=CacheMode.BYPASS,  # New way to handle cache
+    #     # Only execute JS without reloading page
+    #     # simulate_user=True,      # Simulate human behavior
+    #     # override_navigator=True,  # Override navigator properties
+    # )   # Default crawl run configuration
+
+    return result2.extracted_content

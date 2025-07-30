@@ -5,13 +5,18 @@ import json
 import logging
 import os
 import re
+import psutil
+# from upstash_redis.asyncio import Redis
+from redis.asyncio import Redis  # Use redis.asyncio for async Redis operations
 import yaml
 from celery.result import AsyncResult # Import AsyncResult
 from enum import Enum
 from pathlib import Path
-from typing import Dict
+from typing import Any, AsyncGenerator, Dict, Optional
 import crawl4ai as _c4
 
+
+logger = logging.getLogger(__name__)
 
 class TaskStatus(str, Enum):
     READY = "Ready"
@@ -105,6 +110,12 @@ def safe_eval_config(expr: str) -> dict:
                {"__builtins__": {}}, safe_env)
     return obj.dump()
 
+def datetime_handler(obj: any) -> Optional[str]: # type: ignore
+    """Handle datetime serialization for JSON."""
+    if hasattr(obj, 'isoformat'):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+    
 def should_cleanup_task(created_at: str, ttl_seconds: int = 3600) -> bool:
     """Check if task should be cleaned up based on creation time."""
     created = datetime.fromisoformat(created_at)
@@ -122,6 +133,13 @@ def decode_redis_hash(hash_data: Dict[bytes, bytes] | Dict[str, str]) -> Dict[st
         result[k] = v
     return result
 
+# --- Helper to get memory ---
+def _get_memory_mb():
+    try:
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception as e:
+        logger.warning(f"Could not get memory info: {e}")
+        return None
 
 def create_task_response(celery_task: AsyncResult, task: Dict[str, str], task_id: str, base_url: str) -> dict:
     """Create response for task status check."""
@@ -142,3 +160,86 @@ def create_task_response(celery_task: AsyncResult, task: Dict[str, str], task_id
         response["error"] = task["error"]
 
     return response
+
+
+async def stream_results(crawler: _c4.AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
+    """Stream results with heartbeats and completion markers."""
+    import json
+    from utils import datetime_handler
+
+    try:
+        async for result in results_gen:
+            try:
+                server_memory_mb = _get_memory_mb()
+                result_dict = result.model_dump()
+                result_dict['server_memory_mb'] = server_memory_mb
+                logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
+                data = json.dumps(result_dict, default=datetime_handler) + "\n"
+                yield data.encode('utf-8')
+            except Exception as e:
+                logger.error(f"Serialization error: {e}")
+                error_response = {"error": str(e), "url": getattr(result, 'url', 'unknown')}
+                yield (json.dumps(error_response) + "\n").encode('utf-8')
+
+        yield json.dumps({"status": "completed"}).encode('utf-8')
+        
+    except asyncio.CancelledError:
+        logger.warning("Client disconnected during streaming")
+    finally:
+        try:
+            await crawler.close()
+        except Exception as e:
+            logger.error(f"Crawler cleanup error: {e}")
+        pass
+
+
+
+
+async def stream_pubsub_results(redis: Redis, channel: str, results_gen):
+    """Publish results with heartbeats and completion markers to a Redis channel."""
+    try:
+        data: list[dict[str, Any]] | str = []
+        result: _c4.CrawlResult
+        complete = {"status": "ok", "message": "completed"}
+        async for result in results_gen :
+            try:
+                server_memory_mb = _get_memory_mb()
+                result_dict = result.model_dump()
+                result_dict['server_memory_mb'] = server_memory_mb
+                result_dict['status'] = "model_dump"
+                url = result_dict.get('url', 'unknown')
+                logger.info(f"Publishing result for {url}")
+                
+                # Serialize and return the results, using model_dump if available
+                model_dump = result_dict if hasattr(result, 'model_dump') else {"status": "No model_dump available"}
+                
+                # Append only if dump is a dictionary
+                if isinstance(model_dump, dict):
+                    data.append(model_dump)
+                else:
+                    raise ValueError(model_dump)
+                
+                # This block of code is part of a function that streams results and publishes them to
+                # a Redis channel with some additional processing
+                await redis.xadd(channel, {"status": "ok", "message": "processing", "url": url, "dump": json.dumps(model_dump, default=datetime_handler) })  # Publish to Redis channel
+                
+                # give some time to redis
+                await asyncio.sleep(1)
+            
+            except Exception as e:
+                logger.error(f"Serialization error: {e}")
+                error_response = {"status": "error", "message": str(e), "url": getattr(result, 'url', 'unknown')}
+                
+                await redis.xadd(channel, {key: str(value) if isinstance(value, bool) else value  for key, value in error_response.items() } )  # Publish error response
+                complete = {"status": "error", "message": "completed"}
+        
+        await redis.xadd(channel, {key: str(value) if isinstance(value, bool) else value  for key, value in complete.items()})  # Publish completion marker
+
+        return data
+        
+
+    except asyncio.CancelledError:
+        logger.warning("Client disconnected during streaming")
+    
+    # finally:
+    #     await redis.close()  # Make sure to properly close the Redis connection

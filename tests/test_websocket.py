@@ -1,14 +1,16 @@
 import asyncio
+import logging
 import pytest
 import websockets
 
 WS_URL = "ws://localhost:8000/ws/events"
-
+logger = logging.getLogger(__name__)
 @pytest.mark.asyncio
 async def test_websocket_events():
     async with websockets.connect(WS_URL) as websocket:
         # Wait for a message from the server
         msg = await websocket.recv()
+        logger.info(f"Received message: {msg}")
         if isinstance(msg, bytes):
             msg_str = msg.decode("utf-8")
         elif isinstance(msg, (bytearray, memoryview)):

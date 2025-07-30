@@ -15,6 +15,7 @@ class MarkdownRequest(BaseModel):
                                         description="Content‑filter strategy: FIT, RAW, BM25, or LLM")
     q:   Optional[str] = Field(None,  description="Query string used by BM25/LLM filters")
     c:   Optional[str] = Field("0",   description="Cache‑bust / revision counter")
+    browser_config: Optional[Dict] = Field(default_factory=dict, description="Browser configuration for the crawler")
 
 
 class RawCode(BaseModel):
@@ -38,4 +39,12 @@ class JSEndpointRequest(BaseModel):
     scripts: List[str] = Field(
         ...,
         description="List of separated JavaScript snippets to execute"
+    )
+
+
+class OpenAIModelFee(BaseModel):
+    model_name: str = Field(..., description="Name of the OpenAI model.")
+    input_fee: str = Field(..., description="Fee for input token for the OpenAI model.")
+    output_fee: str = Field(
+        ..., description="Fee for output token for the OpenAI model."
     )
