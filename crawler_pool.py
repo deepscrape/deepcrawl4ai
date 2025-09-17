@@ -37,9 +37,9 @@ async def get_crawler(cfg: BrowserConfig) -> tuple[AsyncWebCrawler, str]:
             POOL[sig] = crawler; LAST_USED[sig] = time.time()
             return crawler, sig
     except MemoryError as e:
-        raise MemoryError(f"RAM pressure – new browser denied: {e}")
+        raise MemoryError(f"RAM pressure – new browser denied: {str(e)}")
     except Exception as e:
-        raise RuntimeError(f"Failed to start browser: {e}")
+        raise RuntimeError(f"Failed to start browser: {str(e)}")
     finally:
         if sig in POOL:
             LAST_USED[sig] = time.time()

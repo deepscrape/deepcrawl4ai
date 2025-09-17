@@ -19,3 +19,5 @@ prometheus-fastapi-instrumentator
 redis[hiredis]
 celery
 courlan
+aioboto3
+zstandard

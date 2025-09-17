@@ -9,7 +9,8 @@
 # import firebase_admin
 
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from functools import partial
 import json
 import logging
@@ -20,9 +21,9 @@ from uuid import uuid4
 from courlan import get_base_url
 from crawl4ai import AsyncWebCrawler, BM25ContentFilter, BrowserConfig, CacheMode, CrawlResult, CrawlerRunConfig, DefaultMarkdownGenerator, LLMConfig, LLMContentFilter, LLMExtractionStrategy, LXMLWebScrapingStrategy, MemoryAdaptiveDispatcher, PruningContentFilter, RateLimiter
 from crawl4ai.utils import perform_completion_with_backoff
-
+from schemas import CrawlOperation
 from fastapi import HTTPException, Request,status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import psutil
 import time
 from datetime import datetime # Import datetime for Celery task ID generation
@@ -31,13 +32,27 @@ from celery.result import AsyncResult # Import AsyncResult
 from upstash_redis.asyncio import Redis
 
 from crawler_pool import cancel_crawler
-from utils import FilterType, TaskStatus, _get_memory_mb, create_task_response, decode_redis_hash, is_task_id, should_cleanup_task
+from crawlstore import setCrawlOperation, updateCrawlOperation
+from firestore import FirebaseClient, db
+from monitor import WorkerMonitor
+from redisCache import REDIS_CHANNEL
+from scrape import should_process_tasks
+from utils import FilterType, TaskStatus, _get_memory_mb, convert_celery_status, create_task_status_response, decode_redis_hash, is_task_id, should_cleanup_task, task_status_color
 from celery_app import celery_app # Import celery_app
 from tasks import crawl_stream_task, crawl_task, llm_extraction_task # Import Celery tasks
 
 logger = logging.getLogger(__name__)
+# At module level
+_firebase_client = None
+_db_instance = None
 
-    
+async def get_firebase_client():
+    global _firebase_client, _db_instance
+    if _firebase_client is None:
+        _firebase_client = FirebaseClient()
+        _db_instance, _ = _firebase_client.init_firebase()
+    return _db_instance
+
 
 # class ScrapingOperation(BaseModel):
 #     urls: List[str]
@@ -377,7 +392,7 @@ async def handle_crawl_job(
     # Store initial task details in Redis, signature will be updated by worker
     await redis.hset(f"task:{task_id}", values={
         "status": TaskStatus.IN_PROGRESS.value, # Convert Enum to string
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "urls": json.dumps(urls),
         "result": "",
         "error": "",
@@ -385,9 +400,12 @@ async def handle_crawl_job(
     return {"task_id": task_id}
 
 async def handle_crawl_stream_job(
+        temp_task_id: str,
         redis: Redis,
+        uid: str,
         base_url: str,
         urls: List[str],
+        operation_data: Dict,
         browser_config: Dict,
         crawler_config: Dict,
         config: Dict,
@@ -395,42 +413,83 @@ async def handle_crawl_stream_job(
     
     """ Fire-and-forget version of handle_stream_crawl_request.
     Creates a task in Redis, runs the heavy work in a background task and publish to redis pub/sub,
-    lets /crawl/job/{task_id} polling fetch the result by websockets """
+    lets /crawl/stream/job polling fetch the result by SSE """
 
     logger.info(f"Enqueuing a streaming crawl job for URLs: {urls}")
     # print crawler_config
     logger.info(f"Crawler config: {crawler_config}")
+    
+    # # Only process if system is healthy
+    # if await should_process_tasks(monitor.metrics):
+
+    # data: CrawlOperation
+    doc_ref = db.collection(f"users/{uid}/operations").document()
+    operation_id = doc_ref.id
 
     # Enqueue the task to Celery
-    task = crawl_stream_task.delay(urls, browser_config, crawler_config)
+    task = crawl_stream_task.delay(uid, operation_id, urls, browser_config, crawler_config)
+
+    # get the celery task id
     task_id = task.id
 
+    operation_data["task_id"] = task_id  # Add the task ID to operation_data
+
+    # save To firestore
+    await setCrawlOperation(uid, operation_data, db, doc_ref)
+    
+    pipe = redis.pipeline()
+    # this method is temporary, and is used for celery task cancelation 
+    pipe.hset(f"temp_task_id:{temp_task_id}", "celery_task_id", task_id)
 
     # Store initial task details in Redis, signature will be updated by worker
-    await redis.hset(f"task:{task_id}", values={
+    pipe.hset(f"task:{task_id}", values={
         "status": TaskStatus.IN_PROGRESS.value, # Convert Enum to string
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "urls": json.dumps(urls),
+        "temp_task_id": temp_task_id,
+        "operation_id": operation_id,
         "result": "",
         "error": "",
     })
 
+    await pipe.exec()
+
+
+    # return a json response by status and reference links
     return JSONResponse({
         "task_id": task_id,
+        "temp_task_id": temp_task_id,
+        "operationId": operation_id,
         "status": TaskStatus.IN_PROGRESS.value, # Convert Enum to string
         "_links": {
             "self": {"href": f"{base_url}crawl/stream/job/{task_id}"},
-            "status": {"href": f"{base_url}crawl/stream/job/{task_id}"}
+            "status": {"href": f"{base_url}crawl/stream/job/{task_id}"},
+            "cancel": {"href": f"{base_url}crawl/job/cancel/{temp_task_id}"}
         }
     })
 
+    # if res[1] == "OK":
+        
+    # else:
+    #     raise ValueError("Failed to execute Redis pipeline")
 
 
-async def cancel_a_job(redis: Redis, task_id: str, force: bool = False):
+async def cancel_a_job(
+        redis: Redis,
+        uid: str,
+        temp_task_id: str, 
+        *,
+        force: bool = False):
 
     """Cancel a running crawl job using Celery's revocation."""
     
+    response = {"status": "ok", "message": f"Task {temp_task_id} canceled successfully."}
+
+    task_id = await redis.hget(key=f"temp_task_id:{temp_task_id}", field='celery_task_id')
+
     task_info = await redis.hgetall(f"task:{task_id}")
+
+    operation_id = task_info.get("operation_id") if task_info else None
 
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -440,21 +499,85 @@ async def cancel_a_job(redis: Redis, task_id: str, force: bool = False):
         if (browser_sign and browser_sign != "no_signature"):
             await cancel_crawler(browser_sign)  # Remove the crawler to free resources
 
-        # Revoke the Celery task
-        import signal
-        celery_app.control.revoke(
-            task_id,
-            terminate=True,
-            signal=signal.SIGKILL if force else signal.SIGTERM if os.name == 'posix' else signal.SIGTERM
-        )
-        
 
-        await redis.hset(f"task:{task_id}", 
-                         values={
-                             "status": TaskStatus.CANCELED.value, 
-                             "update_at": datetime.utcnow().isoformat()
-                            })
-        return {"message": f"Task {task_id} canceled successfully."}
+        celery_task = AsyncResult(task_id, app=celery_app)
+
+        if not celery_task.ready():
+            # Revoke the Celery task
+            import signal
+            celery_task.revoke(
+                terminate=True,
+                signal=signal.SIGKILL if force else signal.SIGTERM if os.name == 'posix' else signal.SIGTERM
+            )
+            
+        while True:
+            # Check the task status to see if it's finished
+            if celery_task.ready():
+                
+                # print at the screen
+                logger.info(f"celery status: {celery_task.status}")
+
+                # if these two conditions approved break from loop
+                if celery_task.successful() or celery_task.failed():
+                    response = {"status": "warning", "message": f"The task {temp_task_id} can’t be canceled because it has already finished."}
+                    break
+
+                # if task revoked or canceled
+                else:
+                    # # init client firebase
+                    # db = await get_firebase_client()
+
+                    # convert pydantic class to celery class task
+                    status = convert_celery_status(celery_task.status)  # Get the final status of the task
+                    
+                    # calculate the end time
+                    duration = time.time() - datetime.fromisoformat(task_info["created_at"]).timestamp()
+                    pipe = redis.pipeline()
+                    pipe.hset(
+                        f"operation_metrics:{operation_id}",
+                        values={
+                            "duration": duration,
+                            "status": status,
+                        },
+                    )
+
+                    # update redis
+                    pipe.hset(f"task:{task_id}",
+                        values={
+                            "status": status.value, 
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "result": json.dumps(celery_task.result) if isinstance(celery_task.result, (dict, list)) else str(celery_task.result),
+                    })
+
+                    await pipe.exec()
+
+                    # if pipeOK[1] == "OK":
+                    #     pipeOK[0]
+                    # else:
+                    #     logger.error(f"Failed to update task {task_id} status in Redis after cancellation.")
+
+                    if task_id and uid and uid != "jwt_disabled" and operation_id:
+                        
+                        # TODO: FIREBASE UPDATE - change to redis update
+                        # Update the operation status in the fire database
+                        await updateCrawlOperation(
+                            uid,
+                            operation_id,
+                            {
+                                "status": TaskStatus.CANCELED,
+                                "color": task_status_color(TaskStatus.CANCELED),
+                                "updated_At": datetime.now(timezone.utc).isoformat(),
+                                "duration": duration,
+                            },
+                            db,
+                        )
+                    
+                    break
+
+            await asyncio.sleep(0.3)  # Wait before checking again
+
+        return response
+    
     except Exception as e:
         logger.error(f"Error revoking Celery task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to cancel task: {e}")
@@ -467,22 +590,79 @@ async def handle_task_status(
     keep: bool = False
 ) -> JSONResponse:
     """Handle task status check requests."""
+
+    # get the task from redis
     task = await redis.hgetall(f"task:{task_id}")
+
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            detail={
+                "status": "error",
+                "message": "Task not found"
+            }
         )
-    celery_task = AsyncResult(task_id, app=celery_app)
-    task = decode_redis_hash(task)
-    response = create_task_response(celery_task, task, task_id, base_url)
+    celery_task = AsyncResult(task_id, app=celery_app) # Re-initialize celery_task here
 
+    # query celery task state by task id
+    task = decode_redis_hash(task)
+
+    response = create_task_status_response(celery_task, task, task_id, base_url)
+
+    # remove task from redis keep metadata in firebase
     if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELED]:
         if not keep and should_cleanup_task(task["created_at"]):
             await redis.delete(f"task:{task_id}")
+            await redis.delete(f"{REDIS_CHANNEL}:{task_id}")
+            await redis.delete(f"celery-task-meta-{task_id}")
+            await redis.delete(f"temp_task_id:{task['temp_task_id']}")
 
     return JSONResponse(response)
 
+async def handle_stream_task_status(
+    task,
+    task_id,
+    base_url: str = "",
+):
+    
+    
+    task = decode_redis_hash(task)
+    async def stream_task_status():
+        while True:
+            # Check the task status to see if it's finished
+            from celery.result import AsyncResult # Import AsyncResult here
+            from celery_app import celery_app # Import celery_app here
+            celery_task = AsyncResult(task_id, app=celery_app) # Re-initialize celery_task here
+
+            if celery_task.ready():
+                # You can get the final status and yield it
+                final_response = create_task_status_response(celery_task, task, task_id, base_url)
+                data = f"data: {json.dumps(final_response)}\n"
+
+                yield data
+                break  # Exit the loop when the task is complete
+
+            # Yield the current status while waiting
+            response = create_task_status_response(celery_task, task, task_id, base_url)
+            data = f"data: {json.dumps(response)}\n"
+
+            logger.info(f"send current status of celery app {data}")
+            
+            yield data
+            
+            await asyncio.sleep(1)  # Wait before checking again
+
+        yield "data: [DONE]"
+
+    return StreamingResponse(
+        stream_task_status(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Stream-Status": "active",
+        }
+    )
 
 async def create_new_task(
     redis: Redis,
@@ -504,7 +684,7 @@ async def create_new_task(
 
     await redis.hset(f"task:{task_id}", values={
         "status": TaskStatus.IN_PROGRESS.value, # Convert Enum to string
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "url": decoded_url,
     })
 

@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 from utils import FilterType
@@ -5,6 +6,8 @@ from utils import FilterType
 
 class CrawlRequest(BaseModel):
     urls: List[str] = Field(min_length=1, max_length=100)
+    temp_task_id: str
+    operation_data: Optional[Dict] = Field(default_factory=dict)
     browser_config: Optional[Dict] = Field(default_factory=dict)
     crawler_config: Optional[Dict] = Field(default_factory=dict)
 
@@ -48,3 +51,86 @@ class OpenAIModelFee(BaseModel):
     output_fee: str = Field(
         ..., description="Fee for output token for the OpenAI model."
     )
+
+
+class CrawlStorageMetadata(BaseModel):
+    created_At: int
+    updated_At: Optional[int] = None
+    file_compressed_size: int
+    file_size: int
+    file_name: str
+    key_name: str
+
+class CrawlStorage(BaseModel):
+    error: Optional[str] = None
+    metadata: CrawlStorageMetadata
+    url: str
+class AIModel(BaseModel):
+    name: str
+    code: str
+
+class Author(BaseModel):
+    uid: str
+    displayName: str
+
+class CrawlJobType(str, Enum):
+    PLAYGROUND = "playground"
+    OPERATION = "operation"
+
+class CrawlOperation(BaseModel):
+    id: Optional[str] = None
+    urls: List[str]
+    author: Author
+    name: Optional[str] = None
+    color: str
+    urlPath: Optional[str] = None
+    type: str # Replace with Enum if you have a taskType enum CrawlJobType
+    modelAI: Optional[AIModel] = None
+    created_At: int
+    updated_At: Optional[int] = None
+    scheduled_At: Optional[int] = None
+    prompt: Optional[str] = None
+    status: str  # Replace with Enum if you have a taskStatus enum
+    metadataId: Optional[str] = None  # CrawlPack
+    error: Optional[str] = None
+    storage: Optional[List[CrawlStorage]] = None
+
+# ONE OPERATION DEFINED AS MULTIPLE TASKS
+class OperationResult(BaseModel):
+    operation_id: str
+    machine_id: str
+    duration: float
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    peak_memory: Optional[float] = None
+    memory_used: Optional[float] = None
+    status: str
+    urls_processed: Optional[int] = None
+    error: Optional[str] = None
+
+class SystemStats(BaseModel):
+    cpu_usage: float
+    memory_usage: float
+    queue_length: int
+    error_rate: float
+
+class ResourceStatus(BaseModel):
+    memory_ok: bool
+    cpu_ok: bool
+    memory_usage: float
+    cpu_usage: float
+    per_core_usage: list[float]
+
+class CoreMetrics(BaseModel):
+    core_id: int
+    cpu_usage: float
+    memory_usage: float
+
+# FIXME: This class likely represents a product entity and inherits from a base model class.
+class Product(BaseModel):
+    name: str
+    price: str
+
+class UserAbortException(Exception):
+    """Raised when a user aborts the operation."""
+    pass

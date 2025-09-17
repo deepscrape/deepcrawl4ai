@@ -11,6 +11,28 @@ async def updateCrawlOperation(userId, operation_id, data, db):
             f"\033[91mERROR:\033[0m     \033[93mFailed to update document: {e}\033[0m"
         )
 
+async def setCrawlOperation(userId, data, db, doc_ref=None):
+    try:
+        # Use existing document reference if operation_id is provided
+        if doc_ref:
+            doc_ref.set(data)
+            print(
+                f"\033[94mINFO:\033[0m     \033[92mDocument updated with ID: {doc_ref.id}\033[0m"
+            )
+            return doc_ref.id
+        else:
+            # Create a new document if operation_id is not provided
+            doc_ref = db.collection(f"users/{userId}/operations").document()
+            doc_ref.set(data)
+            print(
+                f"\033[94mINFO:\033[0m     \033[92mDocument created with ID: {doc_ref.id}\033[0m"
+            )
+            return doc_ref.id
+    except Exception as e:
+        print(
+            f"\033[91mERROR:\033[0m     \033[93mFailed to create or update document: {e}\033[0m"
+        )
+        raise e
 
 async def getCrawlMetadata(metadataId, userId, db):
     """

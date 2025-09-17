@@ -10,7 +10,6 @@ security = HTTPBearer()
 # Use an Firebase API key (32 characters long)
 """  api_key  """
 
-
 def verify_token(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security),
@@ -28,8 +27,11 @@ def verify_token(
  
         decoded_token = auth.verify_id_token(token)
         request.state.user = decoded_token
+
+        # Set uid separately for convenience
+        request.state.uid = decoded_token.get("uid")
+        
         return decoded_token
-        # return decoded_token
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 

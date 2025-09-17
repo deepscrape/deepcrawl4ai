@@ -8,3 +8,4 @@ OPERATION_DURATION = Histogram(
     "scraper_operation_duration_seconds", "Time spent on scraping operations"
 )
 ERROR_COUNTER = Counter("scraper_errors_total", "Total number of scraping errors")
+SUCCESS_COUNTER = Counter("scraper_success_total", "Total number of successful scrapes")

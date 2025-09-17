@@ -1,34 +1,99 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import os
 from functools import partial # Import partial
+import sys
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import AsyncGenerator, Dict, List, Optional, cast
 from urllib.parse import unquote
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlResult, CrawlerRunConfig, DefaultMarkdownGenerator, LLMConfig, LLMContentFilter, LLMExtractionStrategy, LXMLWebScrapingStrategy, MemoryAdaptiveDispatcher, PruningContentFilter, RateLimiter
-from crawl4ai.utils import perform_completion_with_backoff
+# from crawl4ai.utils import perform_completion_with_backoff
 from fastapi import HTTPException, status
-import psutil
+from redis import RedisError
+# import psutil
 
 
-from redisCache import REDIS_CHANNEL, redis, pure_redis
+from crawlstore import updateCrawlOperation
+from firestore import FirebaseClient
+from monitor import WorkerMonitor
+from redisCache import REDIS_CHANNEL, redis as redis_cache, pure_redis as pure_redis_cache
 
 from celery_app import celery_app
 from celery.exceptions import SoftTimeLimitExceeded
-from utils import FilterType, TaskStatus, _get_memory_mb, datetime_handler, decode_redis_hash, is_task_id, setup_logging, should_cleanup_task, load_config, stream_pubsub_results
+from schemas import OperationResult
+from utils import FilterType, TaskStatus, _get_memory_mb, datetime_handler, decode_redis_hash, is_task_id, setup_logging, should_cleanup_task, load_config, stream_pubsub_results, task_status_color
 from crawler_pool import get_crawler, cancel_crawler
+
+# # Global Redis clients for all Celery tasks
+# redis_url = os.environ.get("UPSTASH_REDIS_REST_URL")
+# redis_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+# REDIS_PORT = os.environ.get("UPSTASH_REDIS_PORT")
+# REDIS_USERNAME = os.environ.get("UPSTASH_REDIS_USER")
+# REDIS_PASSWORD = os.environ.get("UPSTASH_REDIS_PASS")
+
+# if not redis_url or not redis_token or not REDIS_PORT or not REDIS_USERNAME or not REDIS_PASSWORD:
+#     raise RuntimeError("Missing one or more Upstash Redis environment variables.")
+
+# REDIS_URL = redis_url.replace("https://", "")
+
+# # Global Upstash Redis client
+# redis = Redis(
+#     url=str(redis_url),
+#     token=str(redis_token),
+#     allow_telemetry=False,
+# )
+
+# # Global PureRedis client
+# pure_redis = PureRedis(
+#     host=str(REDIS_URL),
+#     port=int(REDIS_PORT),
+#     db=0,
+#     username=str(REDIS_USERNAME),
+#     password=str(REDIS_PASSWORD),
+#     ssl=True,
+#     decode_responses=True
+# )
 
 config = load_config()
 setup_logging(config)
 logger = logging.getLogger(__name__)
+# At module level
+_firebase_client = None
+_db_instance = None
+
+_redis = None
+_pure_redis = None
+
+
+def get_redis():
+    global _redis, _pure_redis
+    global redis, pure_redis
+    if _redis is None:
+        _redis = redis_cache
+        _pure_redis = pure_redis_cache
+    return _redis, _pure_redis
+
+redis, pure_redis = get_redis()
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+else:
+    import uvloop  # type: ignore
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    
+async def get_firebase_client():
+    global _firebase_client, _db_instance
+    if _firebase_client is None:
+        _firebase_client = FirebaseClient()
+        _db_instance, _ = _firebase_client.init_firebase()
+    return _db_instance
 
 @celery_app.task(bind=True)
 def crawl_task(self, urls: List[str], browser_config: Dict, crawler_config: Dict) :
     """Celery task to handle crawl requests."""
-    import asyncio
     logger.info("Starting crawl task with URLs")
     # logger.info(f"Browser config: {browser_config}")
     # logger.info(f"Crawler config: {crawler_config}")
@@ -124,16 +189,17 @@ async def llm_extraction_task(self, url: str, instruction: str, schema: Optional
         raise
 
 @celery_app.task(bind=True)
-def crawl_stream_task(self, urls: List[str], browser_config: Dict, crawler_config: Dict) -> Dict:
-    """Celery task to process LLM crawl stream."""
+def crawl_stream_task(self, uid: str, operation_id: str, urls: List[str], browser_config: Dict, crawler_config: Dict) -> Dict:
+    """Celery task to process crawl stream."""
 
     try:
-        
-        asyncio.get_event_loop().run_until_complete(_crawl_stream_task_impl(self, urls, browser_config, crawler_config))
+        # Use the global event loop set at module level
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(_crawl_stream_task_impl(self, uid, operation_id, urls, browser_config, crawler_config))
         return {"status": TaskStatus.COMPLETED, "message": "crawl stream task completed successfully."}
     
     except Exception as e:
-        logger.error(f"Error in LLM crawl stream task: {e}")
+        logger.error(f"Error in crawl stream task: {e}")
         return {"status": TaskStatus.FAILED, "message": str(e)}
 
 async def _crawl_task_impl(self, urls: List[str], browser_config: Dict, crawler_config: Dict):
@@ -145,12 +211,20 @@ async def _crawl_task_impl(self, urls: List[str], browser_config: Dict, crawler_
     try:
         browser = BrowserConfig.load(browser_config)
         crawler, sign = await get_crawler(browser) # get_crawler returns crawler and signature
+
+        # init client firebase
+        # db = await get_firebase_client()
+
+        # # set monitor pid
+        # monitor = WorkerMonitor(os.getpid(), db)
+        # monitor.record_operation_start()
+
         # Check for cancellation
         # if self.request.aborted:
         #     await redis.hset(f"task:{task_id}", values={"status": TaskStatus.CANCELED})
         #     return {"status": TaskStatus.CANCELED, "message": "Task aborted by user."}
-
-        await redis.hset(f"task:{task_id}", values={
+        pipe = redis.pipeline()
+        pipe.hset(f"task:{task_id}", values={
             "signature": sign if sign else "no_signature"  # Store signature if available
         })
 
@@ -174,12 +248,14 @@ async def _crawl_task_impl(self, urls: List[str], browser_config: Dict, crawler_
         else:
             logger.info(f"Result type: {type(crawled)}")
 
-        await redis.hset(f"task:{task_id}", values={
+        pipe.hset(f"task:{task_id}", values={
             "signature": sign if sign else "no_signature",  # Store signature if available
             "status": TaskStatus.COMPLETED,
             "result": json.dumps(crawled),  # Ensure result is a string
-            "update_at": datetime.utcnow().isoformat()  # Store update time
+            "updated_at": datetime.now(timezone.utc).isoformat(),  # Store update time
         })
+
+        await pipe.exec()
 
         await cancel_crawler(sign)  # Remove the crawler to free resources
 
@@ -187,6 +263,15 @@ async def _crawl_task_impl(self, urls: List[str], browser_config: Dict, crawler_
 
         # return {"success": True, "results": crawled}
 
+    except RedisError as e:
+        logger.error(f"Redis error in crawl task: {str(e)}", exc_info=True)
+        await redis.hset(f"task:{task_id}", values={
+            "status": TaskStatus.FAILED,
+            "error": str(e),
+        })
+        await cancel_crawler(sign)  # Remove the crawler to free resources
+        raise
+        
     except Exception as e:
         logger.error(f"Celery crawl task error: {str(e)}", exc_info=True)
         await redis.hset(f"task:{task_id}", values={
@@ -204,6 +289,7 @@ async def handle_crawl_request(
     config: dict
 ) -> tuple:
     """Handle non-streaming crawl requests."""
+
     start_mem_mb = _get_memory_mb() # <--- Get memory before
     start_time = time.time()
     mem_delta_mb = None
@@ -276,61 +362,174 @@ async def handle_crawl_request(
 
 async def _crawl_stream_task_impl(
     self,
+    uid: str,
+    operation_id: str,
     urls: List[str],
     browser_config: dict,
-    crawler_config: dict,
+    crawler_config: dict
 ):
     """Handle streaming crawl requests."""
-
-
+    # set task id
     task_id = self.request.id
+
     logger.info(f"Celery task {task_id} started.")
+
+
+    # init client firebase
+    db = await get_firebase_client()
+    # set monitor pid
+    monitor = WorkerMonitor(os.getpid(), db)
+
+    # Update system metrics
+    await monitor.update_metrics()
+    
+    start_time = time.time()
+    await monitor.record_operation_start(operation_id, start_time)
+
+    # set browser signature
     sign = "no_signature"
 
     try:
+        # load browser configuration
         browser = BrowserConfig.load(browser_config)
+        # get browser
         crawler, sign = await get_crawler(browser) # get_crawler returns crawler and signature
 
+        # update the task in redis to report the signature of the browser will be used
         await redis.hset(f"task:{task_id}", values={
             "signature": sign if sign else "no_signature"  # Store signature if available
         })
 
-        results = await handle_stream_crawl_request(
+        start_mem_mb = _get_memory_mb() # <--- Get memory before
+        start_time = time.time()
+        mem_delta_mb = None
+        peak_mem_mb = start_mem_mb
+        
+        # handle stream crawl request 
+        results_gen = await handle_stream_crawl_request(
             urls=urls,
             crawler=crawler,
-            browser_config=browser_config,
-            crawler_config=crawler_config,
-            config=config,
+            _browser=browser,
+            _crawler_config=crawler_config,
+            config=config, # this is the server config yml file data
         )
+        """Handle streaming crawl requests."""
+                
 
         # Stream results to Redis Pub/Sub
         channel = f"{REDIS_CHANNEL}:{task_id}"
-        model_dump_list = await stream_pubsub_results(pure_redis, channel, results)
+
+        if pure_redis is None:
+            raise ValueError("pure_redis is not initialized.")
         
+        _ = await stream_pubsub_results(pure_redis, channel, results_gen)
+
+        end_mem_mb = _get_memory_mb() # <--- Get memory after
+        end_time = time.time()
+        total_time = end_time - start_time
+
+
+        if start_mem_mb is not None and end_mem_mb is not None:
+            mem_delta_mb = end_mem_mb - start_mem_mb # <--- Calculate delta
+            peak_mem_mb = max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb) # <--- Get peak memory
+            logger.info(f"Memory usage: Start: {start_mem_mb} MB, End: {end_mem_mb} MB, Delta: {mem_delta_mb} MB, Peak: {peak_mem_mb} MB, Total Time: {total_time}" )
+
 
         await redis.hset(f"task:{task_id}", values={
             "signature": sign if sign else "no_signature",  # Store signature if available
             "status": TaskStatus.COMPLETED,
-            "result": json.dumps(model_dump_list, default=datetime_handler),  # Ensure result is a string
-            "update_at": datetime.utcnow().isoformat()  # Store update time
+            "result": "",# json.dumps(model_dump_list, default=datetime_handler),  # Ensure result is a string
+            "updated_at": datetime.now(timezone.utc).isoformat(),  # Store update time
             # "server_processing_time_s": total_time,
             # "server_memory_delta_mb": mem_delta_mb,
             # "server_peak_memory_mb": peak_mem_mb
         })
 
+
+        operResult = OperationResult(
+            machine_id=monitor.machine_id,
+            operation_id=operation_id,
+            start_time=start_time,
+            end_time=end_time,
+            duration=total_time,
+            peak_memory=peak_mem_mb,
+            memory_used=mem_delta_mb,
+            status=TaskStatus.COMPLETED,
+            urls_processed=len(urls),
+        )
+        
+        # Record Completed operation metrics 
+        await monitor.record_metrics(operResult)
         
         await cancel_crawler(sign)  # Remove the crawler to free resources
 
         await asyncio.sleep(5)  # Give Redis time to process the update
 
-        # return {"success": True, "results": crawled}
+        # FIXME: Update operation status CHECK THE RESULTS
+        if results_gen and task_id and uid and uid != "jwt_disabled" and operation_id:
+            # TODO: FIREBASE UPDATE - change to redis update
+            await updateCrawlOperation(
+                uid,
+                operation_id,
+                {
+                    "status": TaskStatus.COMPLETED,
+                    "color": task_status_color(TaskStatus.COMPLETED),
+                    "task_id": task_id,
+                    # "storage": results,
+                },
+                db,
+            )
+
+    # except RedisError as e:
+    #     logger.error(f"Redis error in crawl task: {str(e)}", exc_info=True)
+    #     await redis.hset(f"task:{task_id}", values={
+    #         "status": TaskStatus.FAILED,
+    #         "error": str(e),
+    #     })
+    #     await cancel_crawler(sign)  # Remove the crawler to free resources
+    #     raise
 
     except Exception as e:
         logger.error(f"Celery crawl task error: {str(e)}", exc_info=True)
+        # if 'crawler' in locals() and crawler.ready: # Check if crawler was initialized and started
+        # Record the end time for error handling
+        end_time = time.time() 
+        
+        # Handle exceptions and record error metrics
+        operResult = OperationResult(
+            machine_id=monitor.machine_id,
+            operation_id=operation_id,
+            error=str(e),
+            status=TaskStatus.FAILED,
+            duration= end_time - start_time,
+        )
+
+        if task_id and uid and uid != "jwt_disabled" and operation_id:
+            print(f"Error updating operation: {e}")
+
+            # Record error metrics
+            await monitor.record_metrics(operResult)
+            
+            # TODO: FIREBASE UPDATE - change to redis update
+            # Update the operation status in the fire database
+            await updateCrawlOperation(
+                uid,
+                operation_id,
+                {
+                    "status": TaskStatus.FAILED,
+                    "color": task_status_color(TaskStatus.FAILED),
+                    "task_id": task_id,
+                    "error": str(e),
+                },
+                db,
+            )
+
         await redis.hset(f"task:{task_id}", values={
             "status": TaskStatus.FAILED,
             "error": str(e),
         })
+
+
         await cancel_crawler(sign)  # Remove the crawler to free resources
         raise
 
@@ -415,52 +614,57 @@ async def _crawl_stream_task_impl(
 async def handle_stream_crawl_request(
     urls: List[str],
     crawler:AsyncWebCrawler,
-    browser_config: dict,
-    crawler_config: dict,
+    _browser: BrowserConfig,
+    _crawler_config: dict,
     config: dict
-) -> Tuple[AsyncWebCrawler, AsyncGenerator]:
-    """Handle streaming crawl requests."""
+) -> AsyncGenerator:
+    start_mem_mb = _get_memory_mb() # <--- Get memory before
     try:
-        browser_config = BrowserConfig.load(browser_config)
-        # browser_config.verbose = True # Set to False or remove for production stress testing
-        browser_config.verbose = False
-        crawler_config = CrawlerRunConfig.load(crawler_config)
+        browser_config: BrowserConfig = _browser
+        # Set to False or remove for production stress testing
+        browser_config.verbose = True
+        crawler_config: CrawlerRunConfig = CrawlerRunConfig.load(_crawler_config)
         crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
-        # crawler_config.stream = True
-
+        crawler_config.stream = True
         dispatcher = MemoryAdaptiveDispatcher(
             memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
             rate_limiter=RateLimiter(
                 base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
             )
         )
-
-        # crawler = AsyncWebCrawler(config=browser_config)
-        # await crawler.start()
         base_config = config["crawler"]["base_config"]
         # Iterate on key-value pairs in global_config then use haseattr to set them 
         for key, value in base_config.items():
             if hasattr(crawler_config, key):
                 setattr(crawler_config, key, value)
 
-        results_gen = await crawler.arun_many(
+        results_gen: AsyncGenerator = cast(
+            AsyncGenerator,
+            await crawler.arun_many(
             urls=urls,
             config=crawler_config,
             dispatcher=dispatcher
+            )
         )
 
         return results_gen
-
     except Exception as e:
         # Make sure to close crawler if started during an error here
         if 'crawler' in locals() and crawler.ready:
             logger.error(f"Error closing crawler during stream setup exception: {str(e)}")
-
         logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
+        
+         # Measure memory even on error if possible
+        end_mem_mb_error = _get_memory_mb()
+        if start_mem_mb is not None and end_mem_mb_error is not None:
+            mem_delta_mb = end_mem_mb_error - start_mem_mb
 
         # Raising HTTPException here will prevent streaming response
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail=json.dumps({ # Send structured error
+                "error": str(e),
+                "server_memory_delta_mb": mem_delta_mb,
+                # "server_peak_memory_mb": max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb_error or 0)
+            })
         )
-   

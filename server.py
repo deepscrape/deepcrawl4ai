@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Callable
+import signal
 
 # from typing import Annotated  # noqa: F401
 from crawl4ai import AsyncWebCrawler, BrowserConfig
@@ -16,8 +17,20 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Request,
+    status
 )
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.datastructures import Address # Import Address
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    status
+)
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
@@ -29,7 +42,7 @@ from upstash_ratelimit.asyncio import Ratelimit
 
 
 from utils import periodic_client_cleanup
-from redisCache import default_limiter, test_connection, redis
+from redisCache import default_limiter, test_connection, redis, pure_redis
 from crawler_pool import close_all, get_crawler, janitor
 import uvicorn
 
@@ -91,6 +104,7 @@ else:
 ###############################################################
 
 
+# Graceful shutdown for FastAPI
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
@@ -99,6 +113,7 @@ async def lifespan(_: FastAPI):
             **config["crawler"]["browser"].get("kwargs", {}),
         ))           # warm‑up
         await test_connection(redis) # Moved from on_event("startup")
+        await test_connection(pure_redis) # Moved from on_event("startup")
         app.state.janitor = asyncio.create_task(janitor())        # idle GC
         app.state.websocket = asyncio.create_task(periodic_client_cleanup(socket_client))
         yield
@@ -111,6 +126,11 @@ async def lifespan(_: FastAPI):
         if hasattr(app.state, "websocket"):
             app.state.websocket.cancel()
         await close_all()
+        # Wait for background tasks to finish
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 ####################################################################
@@ -124,6 +144,32 @@ app = FastAPI(
     version=config["app"]["version"],
     lifespan=lifespan,
 )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    client: Address | None = request.client
+    client_info = "unknown"
+    if client is not None and client.host is not None:
+        client_info = client.host
+    if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        logger.warning(f"Rate limit exceeded for {client_info}:{request.url.path}")
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Please try again later."},
+            headers=exc.headers
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors(), "body": exc.body},
+    )
 
 
 ####################################################################
@@ -246,7 +292,10 @@ async def rate_limit_middleware(request: Request, call_next):
         return await call_next(request)
 
     # Use client IP as the identifier
-    client_ip = request.client.host if request.client else "unknown"
+    client: Address | None = request.client # Explicitly type client
+    client_ip = "unknown"
+    if client is not None and client.host is not None:
+        client_ip = client.host
     identifier = f"{client_ip}:{request.url.path}"
     
     # Apply default rate limiting
@@ -261,9 +310,10 @@ async def rate_limit_middleware(request: Request, call_next):
     }
 
     if not response.allowed:
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded",
+        logger.warning(f"Rate limit exceeded for {identifier}")
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Please try again later."},
             headers={
                 "Retry-After": str(response.reset),
                 "X-RateLimit-Limit": str(response.limit),
@@ -271,14 +321,15 @@ async def rate_limit_middleware(request: Request, call_next):
                 "X-RateLimit-Reset": str(response.reset)
             }
         )
-    else:
-        response = await call_next(request)
-            
-        # Add rate limit headers to the response
-        response.headers["X-RateLimit-Limit"] = str(request.state.ratelimit["limit"])
-        response.headers["X-RateLimit-Remaining"] = str(request.state.ratelimit["remaining"])
-        response.headers["X-RateLimit-Reset"] = str(request.state.ratelimit["reset"])
-        return response
+    
+    # If allowed, proceed with the request
+    response = await call_next(request)
+        
+    # Add rate limit headers to the response
+    response.headers["X-RateLimit-Limit"] = str(request.state.ratelimit["limit"])
+    response.headers["X-RateLimit-Remaining"] = str(request.state.ratelimit["remaining"])
+    response.headers["X-RateLimit-Reset"] = str(request.state.ratelimit["reset"])
+    return response
 
 # Add CORS middleware
 app.add_middleware(
