@@ -381,15 +381,15 @@ async def root(decoded_token: bool = Depends(verify_token)):
 
 # health check endpoint
 @app.get(config["observability"]["health_check"]["endpoint"])
-async def health(request: Request, response: JSONResponse):
+async def health(request: Request):
     """Health check endpoint."""
     try:
         return JSONResponse({"status": "ok", "timestamp": time.time(), "version": __version__})
     
     except Exception as e:
         logger.error(f"Health check failed: {e}", exc_info=True)
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return JSONResponse({"status": "error", "detail": str(e)})
+        # status code set in JSONResponse below
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 # prometheus metrics endpoint
 @app.get(config["observability"]["prometheus"]["endpoint"])
