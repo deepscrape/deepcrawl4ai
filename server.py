@@ -350,7 +350,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config["app"].get(("cors_origins" if production else "cors_origins_dev"), ["*"]),
+    allow_origins=config["app"].get("cors_origins" if production else "cors_origins_dev", ["*"]),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
