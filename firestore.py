@@ -8,14 +8,24 @@ import firebase_admin
 from firebase_admin import credentials
 import json
 
-
+# Determine which .env file to load
+production = os.getenv("PYTHON_ENV", "development").lower() == "production"
+env_file = ".env" if production else "dev.env"
 # Load environment variables
-load_dotenv()
+load_dotenv(env_file)
 # config = load_config()
-
 fire_config = os.getenv("FIRESTORE_CONFIG")
 firebase_cred = os.getenv("FIREBASE_CREDENTIALS")
 
+# Emulator settings
+print(f"\033[93mINFO-DB:\033[0m Running in {'production' if production else 'development'} mode.")
+
+if not production:
+    firestore_emulator_host = os.getenv("FIRESTORE_EMULATOR_HOST")
+    firebase_auth_emulator_host = os.getenv("FIREBASE_AUTH_EMULATOR_HOST")
+else:
+    firestore_emulator_host = None
+    firebase_auth_emulator_host = None
 
 
 if not fire_config or not firebase_cred:
@@ -37,6 +47,18 @@ class FirebaseClient:
         self.company_credentials = credentials.Certificate(self.firebase_credentials)
 
     def init_firebase(self):
+        # Set environment variables for emulators if present
+        if not production and (firestore_emulator_host or firebase_auth_emulator_host):
+            if firestore_emulator_host:
+                os.environ["FIRESTORE_EMULATOR_HOST"] = firestore_emulator_host
+                print(f"\033[93mINFO-DB:\033[0m Using Firestore emulator at {firestore_emulator_host}")
+            if firebase_auth_emulator_host:
+                os.environ["FIREBASE_AUTH_EMULATOR_HOST"] = firebase_auth_emulator_host
+                print(f"\033[93mINFO-DB:\033[0m Using Firebase Auth emulator at {firebase_auth_emulator_host}")
+
+            print("\033[93mWARNING-DB:\033[0m Running in emulator mode. Data will not be persisted.")
+            self.company_credentials = credentials.ApplicationDefault()
+
         # # Initialize Firebase if not already initialized
         if not firebase_admin._apps:
             # Initialize Firebase app with the company credentials
@@ -45,7 +67,7 @@ class FirebaseClient:
         # Set up Firestore with a custom database ID
         dbName = firestoreConfig["dbName"]  # Replace with your Firestore database ID
 
-        self.db = firebase_admin.firestore.client(database_id=dbName)
+        self.db = firebase_admin.firestore.client(self.app, database_id=dbName)
 
         # Assign the authentication object
         self.auth = firebase_admin.auth
