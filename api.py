@@ -17,14 +17,15 @@ import logging
 import os
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import unquote
-from uuid import uuid4
+from celery.result import AsyncResult # Import AsyncResult here
+from celery_app import celery_app # Import celery_app here
 from courlan import get_base_url
 from crawl4ai import AsyncWebCrawler, BM25ContentFilter, BrowserConfig, CacheMode, CrawlResult, CrawlerRunConfig, DefaultMarkdownGenerator, LLMConfig, LLMContentFilter, LLMExtractionStrategy, LXMLWebScrapingStrategy, MemoryAdaptiveDispatcher, PruningContentFilter, RateLimiter
 from crawl4ai.utils import perform_completion_with_backoff
 from schemas import CrawlOperation
 from fastapi import HTTPException, Request,status
 from fastapi.responses import JSONResponse, StreamingResponse
-import psutil
+import signal
 import time
 from datetime import datetime # Import datetime for Celery task ID generation
 from celery.result import AsyncResult # Import AsyncResult
@@ -504,11 +505,19 @@ async def cancel_a_job(
 
         if not celery_task.ready():
             # Revoke the Celery task
-            import signal
-            celery_task.revoke(
-                terminate=True,
-                signal=signal.SIGKILL if force else signal.SIGTERM if os.name == 'posix' else signal.SIGTERM
-            )
+            # Windows-compatible task revocation
+            if os.name == 'nt':  # Windows
+                celery_task.revoke(terminate=True)
+
+                # Force termination on Windows needs special handling
+                if force:
+                    # Send shutdown event to worker
+                    celery_app.control.broadcast('shutdown')
+            else:  # POSIX systems
+                celery_task.revoke(
+                    terminate=True,
+                    signal=signal.SIGKILL if force else signal.SIGTERM
+                )
             
         while True:
             # Check the task status to see if it's finished
@@ -624,45 +633,72 @@ async def handle_stream_task_status(
     task_id,
     base_url: str = "",
 ):
-    
-    
-    task = decode_redis_hash(task)
-    async def stream_task_status():
-        while True:
-            # Check the task status to see if it's finished
-            from celery.result import AsyncResult # Import AsyncResult here
-            from celery_app import celery_app # Import celery_app here
-            celery_task = AsyncResult(task_id, app=celery_app) # Re-initialize celery_task here
+    """Stream status updates for a task."""
+    try:
+        task = decode_redis_hash(task)
+        
+        async def stream_task_status():
+            try:
+                while True:
+                    # Check the task status to see if it's finished
+                    celery_task = AsyncResult(task_id, app=celery_app) # Re-initialize celery_task here
 
-            if celery_task.ready():
-                # You can get the final status and yield it
-                final_response = create_task_status_response(celery_task, task, task_id, base_url)
-                data = f"data: {json.dumps(final_response)}\n"
+                    try:
+                        celery_task_ready = celery_task.ready()
+                        logger.info(f"Task {task_id}: Current status {celery_task.state}")
+                        # Log status updates less frequently
+                        if celery_task_ready:
+                            logger.info(f"Task {task_id}: Completed with status {celery_task.state}")
 
-                yield data
-                break  # Exit the loop when the task is complete
+                        # Generate status response
+                        response = create_task_status_response(celery_task, task, task_id, base_url)
+                        data = f"data: {json.dumps(response)}\n"  # Note the double newline for SSE format
+                        
+                        
+                        yield data.encode('utf-8')  # Ensure we're yielding bytes
+                        
+                        # Exit when the task is complete
+                        if celery_task_ready:
+                            break
+                            
+                    except Exception as e:
+                        # Handle any serialization errors
+                        error_msg = f"Error generating status response: {str(e)}"
+                        logger.error(error_msg)
+                        yield f"data: {json.dumps({'error': error_msg})}\n".encode('utf-8')
+                        
+                    # Wait before checking again
+                    await asyncio.sleep(1)
+                
+                # Send the [DONE] marker to end the stream
+                yield b"data: [DONE]\n"
+                
+            except Exception as e:
+                # TODO: Handle exceptions in the streaming loop IN the frontend
+                logger.error(f"Fatal error in status stream: {str(e)}", exc_info=True)
+                yield f"event: error\ndata: {json.dumps({'error': str(e), 'fatal': True})}\n".encode('utf-8')
+                yield b"data: [DONE]\n"
 
-            # Yield the current status while waiting
-            response = create_task_status_response(celery_task, task, task_id, base_url)
-            data = f"data: {json.dumps(response)}\n"
-
-            logger.info(f"send current status of celery app {data}")
-            
-            yield data
-            
-            await asyncio.sleep(1)  # Wait before checking again
-
-        yield "data: [DONE]"
-
-    return StreamingResponse(
-        stream_task_status(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Stream-Status": "active",
-        }
-    )
+        return StreamingResponse(
+            stream_task_status(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable proxy buffering
+                "X-Stream-Status": "active",
+            }
+        )
+    except Exception as e:
+        # Return a proper error response instead of letting the exception bubble up
+        logger.error(f"Error setting up status stream for task {task_id}: {str(e)}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "error": f"Failed to stream task status: {str(e)}"
+            }
+        )
 
 async def create_new_task(
     redis: Redis,

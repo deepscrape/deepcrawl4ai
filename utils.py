@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from fastapi import WebSocket
 import psutil
 # from upstash_redis.asyncio import Redis
 from redis.asyncio import Redis  # Use redis.asyncio for async Redis operations 
@@ -16,6 +17,8 @@ from typing import Any, AsyncGenerator, Dict, Optional
 import crawl4ai as _c4
 import urllib.parse
 import random
+
+from redisCache import redis_xadd
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +90,10 @@ def setup_logging(config: Dict) -> None:
         level=config["logging"]["level"],
         format=config["logging"]["format"]
     )
-async def remove_stale_clients(socket_client) -> None:
+async def remove_stale_clients(socket_client: set[WebSocket]) -> None:
     """Remove stale WebSocket clients."""
     
-    disconnected_clients = set()
+    disconnected_clients:set[WebSocket] = set()
     for client in socket_client:
         try:
             await client.send_text("ping")  # Ping the client
@@ -237,7 +240,7 @@ def create_task_status_response(celery_task:AsyncResult, task: Dict[str, str], t
         "task_id": task_id,
         "status": convert_celery_status(celery_task.state) or task["status"],
         "created_at": task["created_at"],
-        "urls": task["urls"],
+        "urls": task.get("urls", ""),
         "_links": {
             "self": {"href": f"{base_url}llm/{task_id}"},
             "refresh": {"href": f"{base_url}llm/{task_id}"}
@@ -245,13 +248,22 @@ def create_task_status_response(celery_task:AsyncResult, task: Dict[str, str], t
     }
 
     if task["status"] == TaskStatus.COMPLETED or celery_task.ready():
-        response["result"] = celery_task.result if celery_task.successful() else None or json.loads(task["result"])
+        # Safely parse result if it exists and isn't empty
+        if celery_task.successful() and celery_task.result:
+            response["result"] = celery_task.result
+        elif task.get("result") and task["result"].strip():
+            try:
+                response["result"] = json.loads(task["result"])
+            except json.JSONDecodeError:
+                # If we can't parse the result as JSON, use it as a string
+                response["result"] = task["result"]
+        else:
+            response["result"] = None
     elif task["status"] == TaskStatus.FAILED or celery_task.failed():
-        response["error"] = task["error"]
+        response["error"] = task.get("error", "Unknown error")
         response["result"] = celery_task.result
 
     return response
-
 
 async def stream_results(crawler: _c4.AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers."""
@@ -297,8 +309,8 @@ async def stream_pubsub_results(redis: Redis, channel: str, results_gen: AsyncGe
     
     result: _c4.CrawlResult
     complete = {"status": "ok", "message": "completed"}
-    # data: list[dict[str, Any]] = []
-    buffer: list[dict[str, Any]] = []
+    # buffer: list[dict[str, Any]] = []
+    pipe2 = redis.pipeline()
     try:
         async for result in results_gen:
             try:
@@ -309,10 +321,9 @@ async def stream_pubsub_results(redis: Redis, channel: str, results_gen: AsyncGe
                 # remove html from result before sending to redis
 
                 result_dict["html"] = ""  # type: ignore
-                # result_dict['server_memory_mb'] = server_memory_mb
+                result_dict['server_memory_mb'] = server_memory_mb
                 # result_dict['status'] = "model_dump"
                 url = result_dict.get('url', 'unknown')
-                logger.info(f"Publishing result for {url}")
 
                 model_dump = result_dict if hasattr(result, 'model_dump') \
                     else {"status": "error", "message": "No model_dump available skipping", 
@@ -320,12 +331,14 @@ async def stream_pubsub_results(redis: Redis, channel: str, results_gen: AsyncGe
 
                 if isinstance(model_dump, dict):
                     # data.append(model_dump)
-                    buffer.append(model_dump)
+                    logger.info(f"Publishing result for {url}")
+                    # buffer.append(model_dump)
                 else:
                     raise ValueError(model_dump)
 
                 batch_json = json.dumps(model_dump, default=datetime_handler, ensure_ascii=False)
                 pipe = redis.pipeline()
+                total_chunks = (len(batch_json) + chunk_size - 1) // chunk_size  # Calculate total chunks
                 # Split batch_json into chunks of chunk_size
                 for i in range(0, len(batch_json), chunk_size):
                     chunk = batch_json[i:i+chunk_size]
@@ -335,27 +348,30 @@ async def stream_pubsub_results(redis: Redis, channel: str, results_gen: AsyncGe
                         "type": "batch_chunk",
                         "url": url,
                         "chunk_index": str(i // chunk_size),
+                        "total_chunks": str(total_chunks),  # Add total_chunks attribute
                         "dump": chunk #.encode("utf-8") if isinstance(chunk, str) else chunk
                     })
                 await pipe.execute()
-                buffer.clear()
 
             except Exception as e:
                 logger.error(f"Serialization error: {e}")
                 error_response = {"status": "error", "message": str(e), "url": getattr(result, 'url', 'unknown')}
-                await redis.xadd(channel, {key: str(value) if isinstance(value, bool) else value  for key, value in error_response.items() } )
+                
+                pipe2.xadd(channel, {key: str(value) if isinstance(value, bool) else value  for key, value in error_response.items() } )
                 complete = {"status": "error", "message": "completed"}
 
-        await redis.xadd(channel, {key: str(value) if isinstance(value, bool) else value  for key, value in complete.items()})
+        pipe2.xadd(channel, {key: str(value) if isinstance(value, bool) else value  for key, value in complete.items()})
 
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
-        await redis.xadd(channel, {"status": "canceled", "message": "streaming canceled"})
+        pipe2.xadd(channel, {"status": "canceled", "message": "streaming canceled"})
     except Exception as e:
         logger.error(f"Unexpected error in stream_pubsub_results: {e}")
-        await redis.xadd(channel, {"status": "error", "message": str(e)})
+        pipe2.xadd(channel, {"status": "error", "message": str(e)})
+        await pipe2.execute()
         return False
 
+    await pipe2.execute()
     return True
 
 
