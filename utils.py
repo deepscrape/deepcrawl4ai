@@ -338,6 +338,7 @@ async def stream_pubsub_results(redis: Redis, channel: str, results_gen: AsyncGe
 
                 batch_json = json.dumps(model_dump, default=datetime_handler, ensure_ascii=False)
                 pipe = redis.pipeline()
+                chunk_size = 4096  # Define chunk_size as a constant (adjust as needed)
                 total_chunks = (len(batch_json) + chunk_size - 1) // chunk_size  # Calculate total chunks
                 # Split batch_json into chunks of chunk_size
                 for i in range(0, len(batch_json), chunk_size):
