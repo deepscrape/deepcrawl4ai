@@ -422,7 +422,7 @@ async def stream_crawl_results(
                     #     yield b"data: {\"type\":\"heartbeat\"}\n"
 
                     # messages = await redis_xread(redis, {channel: '0'}, count=None, block=10000)
-                    if retries > max_retries and not completed_yielded or (celery_task.ready() and retries > 3):
+                    if (retries > max_retries and not completed_yielded) or (celery_task.ready() and retries > 3):
                         logger.info(f"Task {task_id}: Ending stream after {retries} retries with no activity")
                         # if not completed_yielded:
                         #     yield b"data: {\"message\":\"completed\",\"type\":\"auto_complete\"}\n\n"
