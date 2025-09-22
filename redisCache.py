@@ -1,17 +1,21 @@
 # for async use
-import asyncio
 import os
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 # from redis.asyncio import Redis
 from upstash_ratelimit.asyncio import Ratelimit, FixedWindow, TokenBucket
 from upstash_redis.asyncio import Redis
 from redis.asyncio import Redis as PureRedis
+import asyncio
 
 REDIS_CHANNEL = "stream_channel"  # Default channel for streaming data
 
 # ────────────────── configuration  ──────────────────
-load_dotenv()
+production = os.getenv("PYTHON_ENV", "development").lower() == "production" 
+env_file = ".env" if production else "dev.env"
+
+# Load environment variables
+load_dotenv(env_file, verbose=True)
 
 redis_url = os.environ.get("UPSTASH_REDIS_REST_URL")
 redis_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -41,16 +45,28 @@ pure_redis = PureRedis(
     username=REDIS_USERNAME,
     password=REDIS_PASSWORD,
     ssl=True,  # Use SSL if your Redis server supports it
-    decode_responses=True  # Optional: decode responses to UTF-8 strings
+    decode_responses=True,  # Optional: decode responses to UTF-8 strings
 )
 
 async def test_connection(redis: Redis | PureRedis):
-    try:
-        await redis.ping()
-        
-        print("\033[94mINFO-DB:\033[0m  \033[92mRedis connected successfully!\033[0m")
-    except Exception as e:
-        print(f"\033[91mERROR-DB:\033[0m Redis connection failed: {e}")
+    retries = 0
+    max_retries = 100
+    retry_delay = 12  # seconds
+
+    while retries < max_retries:
+        try:
+            await redis.ping()
+            print("\033[94mINFO-DB:\033[0m  \033[92mRedis connected successfully!\033[0m")
+            return
+        except Exception as e:
+            retries += 1
+            print(f"\033[91mERROR-DB:\033[0m Redis connection failed: {e}")
+            print(f"\033[93mWARNING-DB:\033[0m Trying again in 12.00 seconds... (attempt {retries}/{max_retries})")
+            if retries < max_retries:
+                await asyncio.sleep(retry_delay)
+            else:
+                print("\033[91mERROR-DB:\033[0m Max retries reached. Could not connect to Redis.")
+                return
 
 
 # ─────────────────── rate limiters  ──────────────────
@@ -107,3 +123,69 @@ async def redis_subscribe(redis: Redis, channel: str):
         print(f"\033[91mERROR-DB:\033[0m Failed to subscribe to channel '{channel}': {e}")
         return None
     
+
+async def redis_xadd(pipe, channel: str, message: dict, maxlen: Optional[int] = None, approximate: bool = False):
+    """Add a message to a Redis stream with optional maxlen."""
+    if not pipe:
+        print("\033[91mERROR-DB:\033[0m Redis pipe client is not initialized.")
+        return None
+    if not channel:
+        print("\033[91mERROR-DB:\033[0m Channel is empty.")
+        return None
+    if not message:
+        print("\033[91mERROR-DB:\033[0m Message is empty.")
+        return None
+
+    try:
+        pieces = [channel]
+        if maxlen is not None:
+            if maxlen < 0:
+                raise ValueError("maxlen must be a non-negative integer")
+            pieces.append("MAXLEN")
+            if approximate:
+                pieces.append("~")
+            pieces.append(str(maxlen))
+        for key, value in message.items():
+            pieces.extend([key, value])
+
+        message_id = pipe.execute(["XADD", *pieces])
+        return message_id
+    except Exception as e:
+        print(f"\033[91mERROR-DB:\033[0m Failed to add message to stream '{channel}': {e}")
+        return None
+    
+
+async def redis_xread(redis: Redis, streams: dict, count: Optional[int] = None, block: Optional[int] = None):
+    """
+    Read messages from a Redis stream using XREAD.
+    :param redis: Redis client (PureRedis)
+    :param streams: Dictionary of {channel: last_id}
+    :param count: Maximum number of entries to return
+    :param block: Number of milliseconds to block if no messages are available
+    :return: List of messages or None
+    """
+    if not redis:
+        print("\033[91mERROR-DB:\033[0m Redis redis client is not initialized.")
+        return None
+    if not streams:
+        print("\033[91mERROR-DB:\033[0m Streams dictionary is empty.")
+        return None
+
+    try:
+        # Build the XREAD command as a list
+        command = ["XREAD"]
+        if count is not None:
+            command.extend(["COUNT", str(count)])
+        if block is not None:
+            command.extend(["BLOCK", str(block)])
+        command.append("STREAMS")
+        for channel, last_id in streams.items():
+            command.append(channel)
+        for channel, last_id in streams.items():
+            command.append(last_id)
+        result = await redis.execute(command)
+        return result
+    except Exception as e:
+        print(f"\033[91mERROR-DB:\033[0m Failed to read from stream(s) '{list(streams.keys())}': {e}")
+        return None
+# ─────────────────── redis pub/sub  ──────────────────
