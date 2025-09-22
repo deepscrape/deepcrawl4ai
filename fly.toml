@@ -9,6 +9,7 @@ primary_region = 'fra'
 [build]
 
 [env]
+  PYTHON_ENV = 'production'
   UPSTASH_REDIS_PORT = '30766'
   UPSTASH_REDIS_REST_URL = 'https://gusc1-saved-terrapin-30766.upstash.io'
   AWS_ENDPOINT_URL_S3 = 'https://fly.storage.tigris.dev'
@@ -55,8 +56,10 @@ primary_region = 'fra'
     handlers = ["tls", "http"]  # Ensure "tls" is included for HTTPS
 
 [processes]
-  app = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & /opt/noVNC/utils/websockify/run 6080 localhost:5900 --web /opt/noVNC & uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
-  worker = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & celery -A celery_app.celery_app worker --loglevel=info'"
+  app = "sh -c '/opt/noVNC/utils/websockify/run --web /opt/noVNC 0.0.0.0:6080 0.0.0.0:5900 & uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
+  worker = "celery -A celery_app.celery_app worker --loglevel=info"
+  
+  
   # app = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
   # worker = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && celery -A celery_app.celery_app worker --loglevel=info --concurrency=2'"
   # app = "uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"
@@ -66,6 +69,7 @@ primary_region = 'fra'
   memory = '2gb'
   cpu_kind = 'shared'
   cpus = 4
+  swap_size_mb = 512  # Add swap for compilation
 
 [[metrics]]
   port = 8000
