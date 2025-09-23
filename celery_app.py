@@ -1,12 +1,11 @@
-import asyncio
 import logging
 import sys
-from kombu import Queue
+# from kombu import Queue
 import os
 from celery import Celery
 from dotenv import load_dotenv
 import signal
-
+from urllib.parse import urlparse
 
 # if sys.platform == "win32":
 #     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -23,16 +22,16 @@ load_dotenv(env_file, verbose=True)
 # For Upstash Redis, the URL is typically what's needed.
 # We'll use the URL from redisCache.py's environment variables.UPSTASH_REDIS_REST_PASSWORD
 #  rediss://default:4c0962711bf64ff8b7797d38dc0e69e5@gusc1-saved-terrapin-30766.upstash.io:30766/0?ssl_cert_reqs=CERT_REQUIRED
-REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+redis_url = os.environ.get("UPSTASH_REDIS_REST_URL")
 REDIS_PORT = os.environ.get("UPSTASH_REDIS_PORT")
 REDIS_USERNAME = os.environ.get("UPSTASH_REDIS_USER")
 REDIS_PASSWORD = os.environ.get("UPSTASH_REDIS_PASS")
 
 
-if not REDIS_URL or not REDIS_PORT or not REDIS_PASSWORD or not REDIS_USERNAME:
-    raise ValueError("UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_PORT, UPSTASH_REDIS_USER, UPSTASH_REDIS_REST_PASSWORD environment variables must be set for Celery configuration.")
+if not redis_url or not REDIS_PORT or not REDIS_PASSWORD or not REDIS_USERNAME:
+    raise ValueError("UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_PORT, UPSTASH_REDIS_USER, UPSTASH_REDIS_PASS environment variables must be set for Celery configuration.")
 
-REDIS_URL = REDIS_URL.replace("https://", "")
+REDIS_URL = urlparse(redis_url).hostname or redis_url.replace("https://", "").replace("http://", "")
 
 REDIS_URI = f"rediss://{REDIS_USERNAME}:{REDIS_PASSWORD}@{REDIS_URL}:{REDIS_PORT}/0?ssl_cert_reqs=CERT_REQUIRED"
 
