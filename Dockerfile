@@ -125,7 +125,7 @@ RUN groupadd -r appuser && \
 COPY --from=builder ${APP_HOME}/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements.txt && \
-    uv pip install --system playwright websockets && \
+    uv pip install --system playwright && \
     playwright install --with-deps chromium
 
 # Verify installations
