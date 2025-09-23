@@ -428,7 +428,7 @@ async def stream_crawl_results(
                         #     yield b"data: {\"message\":\"completed\",\"type\":\"auto_complete\"}\n\n"
                         # yield b"data: [DONE]\n\n"
                         break
-                    elif retries > max_retries and not completed_yielded and celery_task.state == "PENDING" or celery_task.state == "STARTED":
+                    elif retries > max_retries and not completed_yielded and (celery_task.state in {"PENDING", "STARTED"}):
                         retries = 0
 
 
@@ -462,9 +462,9 @@ async def stream_crawl_results(
                                     if not completed_yielded:
                                         logger.info(f"Task {task_id}: Yielding completion message")
                                         # ADD 'data: ' PREFIX HERE
-                                        yield f"data: {json.dumps(msg_data_dict, ensure_ascii=False)}\n".encode('utf-8')
+                                        yield f"data: {json.dumps(msg_data_dict, ensure_ascii=False)}\n\n".encode('utf-8')
                                         completed_yielded = True
-                                        yield b"data: [DONE]\n"
+                                        yield b"data: [DONE]\n\n"
                                         return
                                     continue
 
@@ -484,16 +484,17 @@ async def stream_crawl_results(
                                 seen_messages.add(unique_id)
                                 
                                 # ADD 'data: ' PREFIX HERE
-                                yield f"data: {json.dumps(msg_data_dict, ensure_ascii=False)}\n".encode('utf-8')
+                                yield f"data: {json.dumps(msg_data_dict, ensure_ascii=False)}\n\n".encode('utf-8')
                     else:
                         # No messages - increment retry counter
                         retries += 1
                         logger.warning(f"No messages returned or malformed response. Retry count: {retries}")
                         
                 except Exception as e:
-                    logger.error(f"Error reading from Redis stream: {e}")
+                    logger.exception("Error reading from Redis stream")
                     # Send error to client as an SSE event
-                    yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n".encode('utf-8')
+                    # Send generic error to client as an SSE event
+                    yield f"event: error\ndata: {json.dumps({'error': 'stream read error'})}\n\n".encode('utf-8')
                     # Optionally end the stream after a serious error
                     retries += 1
                 
@@ -501,17 +502,17 @@ async def stream_crawl_results(
                 await asyncio.sleep(poll_interval)
 
         except asyncio.CancelledError:
-            logger.info(f"Task {task_id}: Stream cancelled by client")
-            yield b"data: {\"message\":\"stream_cancelled\"}\n"
+            logger.info("Task %s: Stream cancelled by client", task_id)
+            yield b"event: canceled\ndata: {\"message\":\"stream_cancelled\"}\n\n"
 
         except Exception as e:
-            logger.error(f"Fatal error in event stream: {e}", exc_info=True)
-            yield f"event: error\ndata: {json.dumps({'error': str(e), 'fatal': True})}\n".encode('utf-8')
+            logger.exception("Fatal error in event stream")
+            yield f"event: error\ndata: {json.dumps({'error': 'fatal stream error', 'fatal': True})}\n\n".encode('utf-8')
         finally:
             seen_messages.clear()
             # Always send DONE if we exit the loop without returning
             if not completed_yielded:
-                yield b"data: [DONE]\n"
+                yield b"data: [DONE]\n\n"
             logger.info(f"Task {task_id}: Stream closed")
 
     return StreamingResponse(
