@@ -665,7 +665,7 @@ async def handle_stream_task_status(
                         # Handle any serialization errors
                         error_msg = f"Error generating status response: {str(e)}"
                         logger.error(error_msg)
-                        yield f"data: {json.dumps({'error': error_msg})}\n".encode('utf-8')
+                        yield f"data: {json.dumps({'error': 'An internal error occurred while generating the status response.'})}\n".encode('utf-8')
                         
                     # Wait before checking again
                     await asyncio.sleep(1)
@@ -676,7 +676,7 @@ async def handle_stream_task_status(
             except Exception as e:
                 # TODO: Handle exceptions in the streaming loop IN the frontend
                 logger.error(f"Fatal error in status stream: {str(e)}", exc_info=True)
-                yield f"event: error\ndata: {json.dumps({'error': str(e), 'fatal': True})}\n".encode('utf-8')
+                yield f"event: error\ndata: {json.dumps({'error': 'A fatal error occurred while streaming the task status.', 'fatal': True})}\n".encode('utf-8')
                 yield b"data: [DONE]\n"
 
         return StreamingResponse(
