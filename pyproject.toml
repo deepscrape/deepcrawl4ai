@@ -1,0 +1,83 @@
+[project]
+name = "crawlagent"
+version = "0.1.0"
+description = "🔥🕷️ Crawl4AI: LLM Web Crawler & scraper"
+authors = [
+    { name = "Prokopis Antoniadis", email = "prokopis123@gmail.com" }
+]
+dependencies = [
+    # Web Framework and Server
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.22.0",
+    "gunicorn>=21.2.0",
+    "websockets>=11.0.3",
+    "uvloop>=0.17.0",
+
+    # Crawling and Scraping
+    "crawl4ai>=0.1.0",
+    "beautifulsoup4~=4.12",
+    "tf-playwright-stealth>=1.1.0",
+    "courlan>=0.9.0",
+
+    # Database and Caching
+    "firebase-admin>=6.2.0",
+    "google-cloud-firestore>=2.11.0",
+    "upstash-redis~=1.4.0",
+    "upstash_ratelimit>=0.0.7",
+    "redis[hiredis]>=4.6.0",
+    "celery>=5.3.1",
+
+    # AWS and Storage
+    "aioboto3>=11.2.0",
+    "zstandard>=0.21.0",
+
+    # Utils and Monitoring
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.10",
+    "psutil>=6.1.1",
+    "aiomultiprocess>=0.9.0",
+    "apscheduler>=3.10.0",
+    "prometheus_client>=0.17.0",
+    "prometheus-fastapi-instrumentator>=6.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.1",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+    "mypy>=1.4.1",
+    "ruff>=0.0.280",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+target-version = ["py312"]
+resolve-log = true
+compile-bytecode = true
+no-installer-metadata = true
+link-mode = "copy"
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+select = ["E", "F", "B", "I"]

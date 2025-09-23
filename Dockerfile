@@ -1,45 +1,62 @@
-# Build stage
+# Build stage with UV
+FROM ghcr.io/astral-sh/uv:0.8.22 AS uv
+
+# Builder stage
 FROM python:3.12-slim AS builder
 
 # Set build-time environment variables
 ENV PYTHONFAULTHANDLER=1 \
     PYTHONHASHSEED=random \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_DEFAULT_TIMEOUT=100 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_INSTALLER_METADATA=1 \
+    UV_LINK_MODE=copy
 
-# Set build arguments
 ARG APP_HOME=/app
-
-# Create app directory
 WORKDIR ${APP_HOME}
 
 # Install build dependencies
 COPY requirements.txt .
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc g++ python3-dev pkg-config libjpeg-dev cmake \
- && rm -rf /var/lib/apt/lists/* \
- && pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
+    build-essential \
+    curl \
+    gcc \
+    g++ \
+    python3-dev \
+    pkg-config \
+    libjpeg-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Use UV to build wheels
+RUN --mount=from=uv,source=/uv,target=/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system -r requirements.txt
+
 # Final stage
 FROM python:3.12-slim
 
 # Metadata
 LABEL maintainer="Prokopis Antoniadis" \
       description="🔥🕷️ Crawl4AI: LLM Web Crawler & scraper" \
-      version="1.0"
+      version="0.1.0"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PYTHON_ENV=production \
+    UV_LINK_MODE=copy \
     DISPLAY=:99
 
 # Set build arguments
 ARG APP_HOME=/app
+
+# Install UV in final stage
+COPY --from=uv /uv /usr/local/bin/uv
+RUN chmod +x /usr/local/bin/uv
 
 WORKDIR ${APP_HOME}
 
@@ -49,18 +66,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     lsof \
     # Add build dependencies for madoka
-    build-essential \
+    build-essential \ 
     curl \
+    gcc \ 
+    g++ \ 
+    python3-dev \
+    pkg-config \
+    libjpeg-dev \
+    cmake \
     wget \
     gnupg \
-    cmake \
-    gcc \
-    g++ \
-    pkg-config \
-    python3-dev \
-    libjpeg-dev \
     supervisor \
-    libnss3 \
     # Playwright system dependencies
     libglib2.0-0 \
     libnss3 \
@@ -102,17 +118,19 @@ RUN groupadd -r appuser && \
     mkdir -p /home/appuser/.cache /ms-playwright && \
     chown -R appuser:appuser /home/appuser /ms-playwright ${APP_HOME}
 
-# Copy wheels from builder
-COPY --from=builder /app/wheels /wheels
-COPY --from=builder /app/requirements.txt .
+# Install Python dependencies using UV
+# COPY --from=builder /app/wheels /wheels
 
-# Install dependencies
-RUN pip install --no-cache-dir /wheels/* \
-    && rm -rf /wheels \
-    && pip install --no-cache-dir playwright \
-    && playwright install --with-deps chromium \
-    && python -c "import crawl4ai; print('✅ crawl4ai is ready to rock!')" \
-    && python -c "from playwright.sync_api import sync_playwright; print('✅ Playwright is feeling dramatic!')"
+# Copy dependencies and install
+COPY --from=builder ${APP_HOME}/requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system -r requirements.txt && \
+    uv pip install --system playwright websockets && \
+    playwright install --with-deps chromium
+
+# Verify installations
+RUN python -c "import crawl4ai; print('✅ crawl4ai is ready to rock!')" && \
+    python -c "from playwright.sync_api import sync_playwright; print('✅ Playwright is feeling dramatic!')"
 
 # Copy application code
 COPY --chown=appuser:appuser . .
@@ -132,14 +150,16 @@ EXPOSE 8000 9222 6080
 #     CMD curl -f http://localhost:8000/health || exit 1
 
 # Copy and set permissions for the entrypoint script
-COPY --chown=root:root docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && \
+    chown root:root /usr/local/bin/docker-entrypoint.sh && \
+    ls -la /usr/local/bin/docker-entrypoint.sh  # Verify permissions
 
 # Switch to non-root user
 USER appuser
 
 # Set the entrypoint
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Start application
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--ws", "websockets"]
