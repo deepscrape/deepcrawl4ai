@@ -15,7 +15,7 @@ from functools import partial
 import json
 import logging
 import os
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, cast
 from urllib.parse import unquote
 from celery.result import AsyncResult # Import AsyncResult here
 from celery_app import celery_app # Import celery_app here
@@ -328,30 +328,36 @@ async def handle_stream_crawl_request(
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator]:
     """Handle streaming crawl requests."""
     try:
-        browser_config = BrowserConfig.load(browser_config)
+        browser_conf = BrowserConfig.load(browser_config)
         # browser_config.verbose = True # Set to False or remove for production stress testing
-        browser_config.verbose = False
-        crawler_config = CrawlerRunConfig.load(crawler_config)
-        crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
-        crawler_config.stream = True
+        browser_conf.verbose = False
+        crawler_conf = CrawlerRunConfig.load(crawler_config)
+        crawler_conf.scraping_strategy = LXMLWebScrapingStrategy()
+        crawler_conf.stream = True
+
+        crawler_cfg = (config.get("crawler") or {})
+        crl_cfg = (config.get("rate_limiter") or {})
 
         dispatcher = MemoryAdaptiveDispatcher(
-            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
-            rate_limiter=RateLimiter(
-                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-            )
+            memory_threshold_percent=crawler_cfg.get("memory_threshold_percent", 80),
+             rate_limiter=RateLimiter(
+                base_delay=tuple(crl_cfg.get("base_delay", (0.2, 1.0)))
+            ) if crl_cfg.get("enabled", False) else None
         )
 
         from crawler_pool import get_crawler
-        bcrawler:tuple[AsyncWebCrawler, str] = await get_crawler(browser_config)
+        bcrawler:tuple[AsyncWebCrawler, str] = await get_crawler(browser_conf)
         crawler, _ = bcrawler
         # crawler = AsyncWebCrawler(config=browser_config)
         # await crawler.start()
 
-        results_gen = await crawler.arun_many(
+        results_gen: AsyncGenerator = cast(
+            AsyncGenerator,
+            await crawler.arun_many(
             urls=urls,
-            config=crawler_config,
+            config=crawler_conf,
             dispatcher=dispatcher
+            )
         )
 
         return crawler, results_gen
@@ -487,10 +493,14 @@ async def cancel_a_job(
     response = {"status": "ok", "message": f"Task {temp_task_id} canceled successfully."}
 
     task_id = await redis.hget(key=f"temp_task_id:{temp_task_id}", field='celery_task_id')
+    if isinstance(task_id, bytes):
+        task_id = task_id.decode('utf-8')
 
-    task_info = await redis.hgetall(f"task:{task_id}")
+    task_raw = await redis.hgetall(f"task:{task_id}")
 
-    operation_id = task_info.get("operation_id") if task_info else None
+    task_info = decode_redis_hash(task_raw) if task_raw else {}
+
+    operation_id = task_info.get("operation_id")
 
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -518,7 +528,7 @@ async def cancel_a_job(
                     terminate=True,
                     signal=signal.SIGKILL if force else signal.SIGTERM
                 )
-            
+        deadline = time.monotonic() + 15  # seconds    
         while True:
             # Check the task status to see if it's finished
             if celery_task.ready():
@@ -582,6 +592,10 @@ async def cancel_a_job(
                         )
                     
                     break
+            
+            if time.monotonic() > deadline:
+                logger.warning("Timeout waiting for task %s to cancel", task_id)
+                break
 
             await asyncio.sleep(0.3)  # Wait before checking again
 
@@ -615,16 +629,20 @@ async def handle_task_status(
 
     # query celery task state by task id
     task = decode_redis_hash(task)
-
+    temp_task_id = task.get("temp_task_id")
     response = create_task_status_response(celery_task, task, task_id, base_url)
 
     # remove task from redis keep metadata in firebase
-    if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELED]:
+    status_str = response["status"].value if isinstance(response["status"], TaskStatus) else response["status"]
+    if status_str in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELED.value}:
         if not keep and should_cleanup_task(task["created_at"]):
-            await redis.delete(f"task:{task_id}")
-            await redis.delete(f"{REDIS_CHANNEL}:{task_id}")
-            await redis.delete(f"celery-task-meta-{task_id}")
-            await redis.delete(f"temp_task_id:{task['temp_task_id']}")
+            pipe = redis.multi()
+            pipe.delete(f"task:{task_id}")
+            pipe.delete(f"{REDIS_CHANNEL}:{task_id}")
+            pipe.delete(f"celery-task-meta-{task_id}")
+            if temp_task_id:
+                pipe.delete(f"temp_task_id:{temp_task_id}")
+            await pipe.exec()
 
     return JSONResponse(response)
 
@@ -652,7 +670,7 @@ async def handle_stream_task_status(
 
                         # Generate status response
                         response = create_task_status_response(celery_task, task, task_id, base_url)
-                        data = f"data: {json.dumps(response)}\n"  # Note the double newline for SSE format
+                        data = f"data: {json.dumps(response)}\n\n"  # Note the double newline for SSE format
                         
                         
                         yield data.encode('utf-8')  # Ensure we're yielding bytes
@@ -665,19 +683,19 @@ async def handle_stream_task_status(
                         # Handle any serialization errors
                         error_msg = f"Error generating status response: {str(e)}"
                         logger.error(error_msg)
-                        yield f"data: {json.dumps({'error': 'An internal error occurred while generating the status response.'})}\n".encode('utf-8')
+                        yield f"data: {json.dumps({'error': error_msg})}\n".encode('utf-8')
                         
                     # Wait before checking again
                     await asyncio.sleep(1)
                 
                 # Send the [DONE] marker to end the stream
-                yield b"data: [DONE]\n"
+                yield b"data: [DONE]\n\n"
                 
             except Exception as e:
                 # TODO: Handle exceptions in the streaming loop IN the frontend
                 logger.error(f"Fatal error in status stream: {str(e)}", exc_info=True)
-                yield f"event: error\ndata: {json.dumps({'error': 'A fatal error occurred while streaming the task status.', 'fatal': True})}\n".encode('utf-8')
-                yield b"data: [DONE]\n"
+                yield f"event: error\ndata: {json.dumps({'error': 'A fatal error occurred while streaming the task status.', 'fatal': True})}\n\n".encode('utf-8')
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
             stream_task_status(),
@@ -691,7 +709,7 @@ async def handle_stream_task_status(
         )
     except Exception as e:
         # Return a proper error response instead of letting the exception bubble up
-        logger.error(f"Error setting up status stream for task {task_id}: {str(e)}", exc_info=True)
+        logger.exception("Error setting up status stream for task %s: %s", task_id, e)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
