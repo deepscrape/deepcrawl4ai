@@ -696,7 +696,7 @@ async def handle_stream_task_status(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "status": "error",
-                "error": f"Failed to stream task status: {str(e)}"
+                "error": "Failed to stream task status due to an internal error."
             }
         )
 
