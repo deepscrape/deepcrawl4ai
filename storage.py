@@ -237,7 +237,7 @@ async def download_file_decompressed(folder_name: str, file_name: str) -> Option
 async def list_files(folder_name: str) -> List[Dict[str, Any]]:
     """List all files in a folder."""
     try:
-        async with await get_s3_client() as svc:
+        async with S3ClientManager() as svc:
             response = await svc.list_objects_v2(
                 Bucket=TIGRIS_BUCKET_NAME,
                 Prefix=f"{folder_name}/"
