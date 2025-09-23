@@ -145,21 +145,24 @@ async def redis_xadd(pipe, channel: str, message: dict, maxlen: Optional[int] = 
             if approximate:
                 pieces.append("~")
             pieces.append(str(maxlen))
+        # When not specifying an explicit ID, Redis requires "*"
+        pieces.append("*")
         for key, value in message.items():
-            pieces.extend([key, value])
+            pieces.extend([str(key), str(value)])
 
-        # Upstash client exposes `execute`; redis-py uses `execute_command` or `xadd`
-        if hasattr(pipe, "execute"):
-            message_id = await pipe.execute("XADD", *pieces)
-        elif hasattr(pipe, "xadd"):
+        # Prefer high-level `xadd` when available
+        if hasattr(pipe, "xadd"):
             kwargs = {}
             if maxlen is not None:
                 kwargs["maxlen"] = maxlen
                 kwargs["approximate"] = approximate
             message_id = await pipe.xadd(channel, message, **kwargs)
         else:
-            # Fallback to redis-py low-level
-            message_id = await pipe.execute_command("XADD", *pieces)
+            # Fallback: Upstash `execute` or redis-py `execute_command`
+            if hasattr(pipe, "execute"):
+                message_id = await pipe.execute("XADD", *pieces)
+            else:
+                message_id = await pipe.execute_command("XADD", *pieces)
         return message_id
     except Exception as e:
         print(f"\033[91mERROR-DB:\033[0m Failed to add message to stream '{channel}': {e}")
