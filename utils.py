@@ -234,7 +234,7 @@ def convert_celery_status(celery_status: CeleryTaskStatus) -> TaskStatus:
     
     return status_mapping.get(celery_status, TaskStatus.READY)  # Default to READY if status is unknown
 
-def create_task_status_response(celery_task:AsyncResult, task: Dict[str, str], task_id: str, base_url: str) -> dict:
+def create_task_status_response(celery_task: AsyncResult, task: Dict[str, str], task_id: str, base_url: str) -> dict:
     """Create response for task status check."""
     response = {
         "task_id": task_id,
@@ -248,16 +248,20 @@ def create_task_status_response(celery_task:AsyncResult, task: Dict[str, str], t
     }
 
     if task["status"] == TaskStatus.COMPLETED or celery_task.ready():
-        # Safely parse result if it exists and isn't empty
-        if celery_task.successful() and celery_task.result:
+        # Handle successful tasks
+        if celery_task.successful():
+            # Always prioritize Celery result, even if it's None or empty
             response["result"] = celery_task.result
-        elif task.get("result") and task["result"].strip():
+        # Only fall back to Redis result if Celery result is not available
+        elif not hasattr(celery_task, 'result') and task.get("result"):
             try:
+                # Try to parse Redis task result as JSON
                 response["result"] = json.loads(task["result"])
             except json.JSONDecodeError:
-                # If we can't parse the result as JSON, use it as a string
+                # If parsing fails, use it as a string
                 response["result"] = task["result"]
         else:
+            # Set explicit None if no result is available
             response["result"] = None
     elif task["status"] == TaskStatus.FAILED or celery_task.failed():
         response["error"] = task.get("error", "Unknown error")
