@@ -19,8 +19,10 @@ WORKDIR ${APP_HOME}
 
 # Install build dependencies
 COPY requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
-
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc g++ python3-dev pkg-config libjpeg-dev cmake \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.txt
 # Final stage
 FROM python:3.12-slim
 
