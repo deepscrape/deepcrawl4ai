@@ -7,10 +7,16 @@ app = 'crawlagent'
 primary_region = 'fra'
 
 [build]
+  # Add build configuration for better build process
+  dockerfile = "Dockerfile"
+  # build-target = "final"
 
 [env]
+  PYTHON_ENV = 'production'
   UPSTASH_REDIS_PORT = '30766'
   UPSTASH_REDIS_REST_URL = 'https://gusc1-saved-terrapin-30766.upstash.io'
+  REDIS_MAX_RETRIES = "100"
+  REDIS_RETRY_DELAY_SEC = "3"
   AWS_ENDPOINT_URL_S3 = 'https://fly.storage.tigris.dev'
   AWS_ENDPOINT_URL_IAM = 'https://fly.iam.storage.tigris.dev'
   AWS_REGION = 'auto'
@@ -39,6 +45,9 @@ primary_region = 'fra'
 
 [[services]]
   internal_port = 9222
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
   protocol = "tcp"
   processes = ["app", "worker"]
 
@@ -49,14 +58,16 @@ primary_region = 'fra'
 [[services]]
   internal_port = 6080
   protocol = "tcp"
-  processes = ["app","worker"]
+  processes = ["app"] # , "worker" Critical: Remove public noVNC (6080) or enforce VNC auth + restrict binding
   [[services.ports]]
     port = 6080
     handlers = ["tls", "http"]  # Ensure "tls" is included for HTTPS
 
 [processes]
-  app = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & /opt/noVNC/utils/websockify/run 6080 localhost:5900 --web /opt/noVNC & uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
-  worker = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & x11vnc -display :99 -nopw -forever -shared -rfbport 5900 -quiet & celery -A celery_app.celery_app worker --loglevel=info'"
+  app = "uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"
+  worker = "celery -A celery_app.celery_app worker --loglevel=info"
+  
+  
   # app = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets'"
   # worker = "sh -c 'Xvfb :99 -screen 0 1280x720x24 & export DISPLAY=:99 && celery -A celery_app.celery_app worker --loglevel=info --concurrency=2'"
   # app = "uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"
@@ -66,6 +77,7 @@ primary_region = 'fra'
   memory = '2gb'
   cpu_kind = 'shared'
   cpus = 4
+  swap_size_mb = 512  # Add swap for compilation
 
 [[metrics]]
   port = 8000

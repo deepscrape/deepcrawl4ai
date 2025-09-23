@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from functools import partial # Import partial
+import platform
 import sys
 import time
 from typing import AsyncGenerator, Dict, List, Optional, cast
@@ -27,6 +28,49 @@ from schemas import OperationResult
 from utils import FilterType, TaskStatus, _get_memory_mb, datetime_handler, decode_redis_hash, is_task_id, setup_logging, should_cleanup_task, load_config, stream_pubsub_results, task_status_color
 from crawler_pool import get_crawler, cancel_crawler
 
+if sys.platform != "win32":
+    import uvloop  # type: ignore
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
+    from asyncio import WindowsProactorEventLoopPolicy as EventLoopPolicy
+    asyncio.set_event_loop_policy(EventLoopPolicy())
+    
+# Track if we're on Windows
+IS_WINDOWS = platform.system() == "Windows"
+
+# Only use a global event loop on Windows with pool=solo
+# On Linux with concurrency, each worker process will manage its own loop
+_event_loop = None
+
+def get_event_loop():
+    """
+    Get or create an event loop in a platform-specific way.
+    
+    On Windows with pool=solo: Returns a persistent global event loop
+    On Linux with multiprocessing: Returns a process-specific event loop
+    """
+    global _event_loop
+    
+    if IS_WINDOWS:
+        # Windows approach: reuse the same event loop for all tasks
+        if _event_loop is None or _event_loop.is_closed():
+            _event_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_event_loop)
+        return _event_loop
+    else:
+        # Linux approach: get the current process's event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            return loop
+        except RuntimeError:
+            # No event loop in current thread, create one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+        
 # # Global Redis clients for all Celery tasks
 # redis_url = os.environ.get("UPSTASH_REDIS_REST_URL")
 # redis_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -46,7 +90,7 @@ from crawler_pool import get_crawler, cancel_crawler
 #     allow_telemetry=False,
 # )
 
-# # Global PureRedis client
+# # # Global PureRedis client
 # pure_redis = PureRedis(
 #     host=str(REDIS_URL),
 #     port=int(REDIS_PORT),
@@ -78,12 +122,7 @@ def get_redis():
 
 redis, pure_redis = get_redis()
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-else:
-    import uvloop  # type: ignore
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    
+
 async def get_firebase_client():
     global _firebase_client, _db_instance
     if _firebase_client is None:
@@ -91,7 +130,7 @@ async def get_firebase_client():
         _db_instance, _ = _firebase_client.init_firebase()
     return _db_instance
 
-@celery_app.task(bind=True)
+@celery_app.task(bind=True,  )
 def crawl_task(self, urls: List[str], browser_config: Dict, crawler_config: Dict) :
     """Celery task to handle crawl requests."""
     logger.info("Starting crawl task with URLs")
@@ -103,16 +142,6 @@ def crawl_task(self, urls: List[str], browser_config: Dict, crawler_config: Dict
         # if self.is_aborted():
         #         # await redis.hset(f"task:{task_id}", values={"status": TaskStatus.CANCELED})
         #         return {"status": TaskStatus.CANCELED, "message": "Task aborted by user."}
-        
-       
-        # return {"status": TaskStatus.COMPLETED, "message": "Crawl task completed successfully."}
-        # async def runner():
-        #     import time
-        #     data = "No URLs provided"
-        #     for i in range(10):  # Long-running task
-        #         time.sleep(1)
-        #         print(f"Crawling {data}, step {i}")
-        #     return f"Crawled {data}"
         
         asyncio.run(_crawl_task_impl(self, urls, browser_config, crawler_config))
 
@@ -193,9 +222,25 @@ def crawl_stream_task(self, uid: str, operation_id: str, urls: List[str], browse
     """Celery task to process crawl stream."""
 
     try:
-        # Use the global event loop set at module level
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_crawl_stream_task_impl(self, uid, operation_id, urls, browser_config, crawler_config))
+        # Get an appropriate event loop for the platform
+        loop = get_event_loop()
+        
+        # Run the implementation
+        loop.run_until_complete(
+            _crawl_stream_task_impl(self, uid, operation_id, urls, browser_config, crawler_config)
+        )
+        
+        # On Linux, we need to clean up pending tasks before returning
+        # On Windows with solo pool, we keep tasks running
+        if not IS_WINDOWS:
+            pending = [task for task in asyncio.all_tasks(loop) 
+                      if not task.done() and task is not asyncio.current_task(loop)]
+            if pending:
+                logger.info(f"Cleaning up {len(pending)} pending tasks")
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
         return {"status": TaskStatus.COMPLETED, "message": "crawl stream task completed successfully."}
     
     except Exception as e:
@@ -462,7 +507,6 @@ async def _crawl_stream_task_impl(
         await monitor.record_metrics(operResult)
         
         await cancel_crawler(sign)  # Remove the crawler to free resources
-
         await asyncio.sleep(5)  # Give Redis time to process the update
 
         # FIXME: Update operation status CHECK THE RESULTS
@@ -533,84 +577,6 @@ async def _crawl_stream_task_impl(
         await cancel_crawler(sign)  # Remove the crawler to free resources
         raise
 
-""" async def handle_stream_crawl_request(
-    urls: List[str],
-    crawler: AsyncWebCrawler,
-    crawler_config: dict,
-    config: dict
-) -> tuple[AsyncGenerator, float, Optional[float], Optional[float]]:
-    Handle non-streaming crawl requests
-    start_mem_mb = _get_memory_mb() # <--- Get memory before
-    start_time = time.time()
-    mem_delta_mb = None
-    peak_mem_mb = start_mem_mb
-    try:
-        urls = [('https://' + url) if not url.startswith(('http://', 'https://')) else url for url in urls]
-
-        crawler_conf = CrawlerRunConfig.load(crawler_config)
-
-        dispatcher = MemoryAdaptiveDispatcher(
-            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
-            rate_limiter=RateLimiter(
-                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-            ) if config["crawler"]["rate_limiter"]["enabled"] else None
-        )
-        
-
-        base_config = config["crawler"]["base_config"]
-        # Iterate on key-value pairs in global_config then use haseattr to set them 
-        for key, value in base_config.items():
-            if hasattr(crawler_conf, key):
-                setattr(crawler_conf, key, value)
-
-        
-        func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
-        partial_func = partial(func, 
-                                urls[0] if len(urls) == 1 else urls, 
-                                config=crawler_conf, 
-                                dispatcher=dispatcher)
-        
-        results = await partial_func()
-
-        # await crawler.close()
-        
-        end_mem_mb = _get_memory_mb() # <--- Get memory after
-        end_time = time.time()
-        total_time = end_time - start_time
-        
-        if start_mem_mb is not None and end_mem_mb is not None:
-            mem_delta_mb = end_mem_mb - start_mem_mb # <--- Calculate delta
-            peak_mem_mb = max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb) # <--- Get peak memory
-            logger.info(f"Memory usage: Start: {start_mem_mb} MB, End: {end_mem_mb} MB, Delta: {mem_delta_mb} MB, Peak: {peak_mem_mb} MB, Total Time: {total_time}" )
-                              
-        # return [{"url": url, 
-        #       "dump": result.model_dump() if hasattr(result, 'model_dump') else "No model_dump available",
-        #      } for url, result in zip(urls, results)], total_time, mem_delta_mb, peak_mem_mb
-        return results, total_time, mem_delta_mb, peak_mem_mb
-
-    except Exception as e:
-        logger.error(f"Crawl error: {str(e)}", exc_info=True)
-        if 'crawler' in locals() and crawler.ready: # Check if crawler was initialized and started
-             try:
-                 await crawler.close()
-             except Exception as e:
-                  logger.error(f"Error closing crawler during exception handling: {str(e)}")
-            
-        # Measure memory even on error if possible
-        end_mem_mb_error = _get_memory_mb()
-        if start_mem_mb is not None and end_mem_mb_error is not None:
-            mem_delta_mb = end_mem_mb_error - start_mem_mb
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=json.dumps({ # Send structured error
-                "error": str(e),
-                "server_memory_delta_mb": mem_delta_mb,
-                "server_peak_memory_mb": max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb_error or 0)
-            })
-        ) """
-
-
 async def handle_stream_crawl_request(
     urls: List[str],
     crawler:AsyncWebCrawler,
@@ -662,7 +628,7 @@ async def handle_stream_crawl_request(
         # Raising HTTPException here will prevent streaming response
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=json.dumps({ # Send structured error
+            detail=json.dumps({  # Send structured error
                 "error": str(e),
                 "server_memory_delta_mb": mem_delta_mb,
                 # "server_peak_memory_mb": max(peak_mem_mb if peak_mem_mb else 0, end_mem_mb_error or 0)

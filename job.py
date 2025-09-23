@@ -3,7 +3,6 @@ import asyncio
 from asyncio.log import logger
 import json
 import logging
-import time
 from typing import Any, Callable, Dict, Optional, Union
 
 from celery import uuid
@@ -12,7 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, HttpUrl
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 
-from redisCache import REDIS_CHANNEL, redis, pure_redis
+from redisCache import REDIS_CHANNEL, redis, pure_redis, redis_xread
 from api import cancel_a_job, handle_crawl_job, handle_crawl_stream_job, handle_llm_request, handle_markdown_request, handle_stream_task_status, handle_task_status
 from auth import get_token_dependency
 from crawl import reader
@@ -21,7 +20,9 @@ from schemas import CrawlOperation, CrawlRequest, MarkdownRequest, RawCode
 
 from triggers import event_stream
 from utils import load_config, safe_eval_config, setup_logging, stream_results
-import gzip
+
+from celery.result import AsyncResult # Import AsyncResult here
+from celery_app import celery_app # Import celery_app here
 
 config = load_config()
 setup_logging(config)
@@ -70,7 +71,7 @@ def init_job_router(config, socket_client: set[Any]) -> APIRouter:
 verify_token = get_token_dependency(config)
 
 
-# ---------- General endpoints ----------------------------------------------
+# ---------- General endpoints FOR Testing PURPOSE --------------------------
 @job_router.get("/user/data")
 async def get_user_data(
     request: Request,
@@ -288,7 +289,7 @@ async def get_task_id(
     
 
 # Cancel and Status general API ENDPOINTS
-@job_router.put("/crawl/job/cancel/{temp_task_id}")
+@job_router.put("/crawl/job/{temp_task_id}/cancel")
 async def crawl_job_cancel(
     request: Request,
     temp_task_id: str,
@@ -319,7 +320,6 @@ async def crawl_job_cancel(
                  }
         )
 
-    
 
 # get status of a crawl job using celery task id
 @job_router.get("/crawl/job/status/{task_id}")
@@ -338,30 +338,30 @@ async def crawl_stream_job_status(
     temp_task_id: str,
     decoded_token: Dict = Depends(verify_token)
 ):
+    """Get status of a crawl stream job using temporary task id with SSE."""
     retries = 0
     while retries < 3:
         try:
             # Get the task from redis
             task_id = await redis.hget(key=f"temp_task_id:{temp_task_id}", field='celery_task_id')
             
-            logger.info(task_id)    
+            if not task_id:
+                logger.info(f"No task_id found for temp_task_id: {temp_task_id}")
+                retries += 1
+                logger.info(f"Retrying to fetch task_id. Attempt {retries}/3")
+                await asyncio.sleep(1)  # Wait before retrying
+                continue
+                
+            logger.info(f"Found task_id: {task_id} for temp_task_id: {temp_task_id}")    
             task = await redis.hgetall(f"task:{task_id}")
 
-            if not task_id or task_id == 'empty' or not task:
+            if task_id == 'empty' or not task:
                 retries += 1
-                logger.info(f"Retrying to fetch task_id for temp_task_id: {temp_task_id}. Attempt {retries}/3")
+                logger.info(f"Task {task_id} not found or empty. Retrying {retries}/3")
                 await asyncio.sleep(1)  # Wait before retrying
                 continue
 
-            if not task:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content={
-                        "status": "error",
-                        "error": "Task not found"
-                    }
-                )
-            
+            # Successfully found task, return the streaming response
             return await handle_stream_task_status(task, task_id, base_url=str(request.base_url))
 
         except Exception as e:
@@ -370,11 +370,12 @@ async def crawl_stream_job_status(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 content={
                     "status": "error",
-                    "error": "Internal server error",
+                    "error": "Internal server error while streaming task status",
                     "internal_message": str(e)
                 }
             )
 
+    # After all retries, return not found
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
         content={
@@ -389,89 +390,138 @@ async def stream_crawl_results(
     task_id: str,
     decoded_token: bool = Depends(verify_token),
     ):
-   
+    
     channel = f"{REDIS_CHANNEL}:{task_id}"  # Unique channel for the task
    
     async def event_stream(channel: str):
+
         completed_yielded = False  # Flag to indicate if the completion message has been yielded
         seen_messages = set()
         retries = 0  # Initialize retry counter
-        while True:
-            
-            await asyncio.sleep(1)  # Simulate waiting for new messages
-            try:                
-                
-                messages = await pure_redis.xread({channel: '0'}, count=None, block=5000)
+        last_id = "0"  # Start from the beginning; use ">" for only new messages after consumer group creation
+        
+    
+        # Redis stream reading configuration
+        poll_interval = 0.5  # Reduced for lower latency
+        count = 20  # Increased for better throughput
+        block_ms = 5000  # 5 seconds block time
+        max_retries = 10
+        """ For real-time streaming, count=15 is a good default: not too small, not too large.
+        If your stream is very high volume, you might increase it (e.g., count=100).
+        If you want lower latency (faster delivery per message), you might decrease it (e.g., count=1). """
 
-                if retries > 12 and not completed_yielded:
-                    logger.info("No completed message received after multiple retries. Ending stream.")
-                    break
+        # Check the task status to see if it's finished
+        celery_task = AsyncResult(task_id, app=celery_app) # Re-initialize celery_task here
+        try:
 
-                logger.info(f"Received messages from Redis: {len(messages)} messages")
+            while True:
 
-                if messages and isinstance(messages, list):
-                    for message in messages:
-                        if len(message) < 2:
-                            logger.warning(f"Unexpected message format: {message}")
-                            continue
+                try:                
+                    # Yield heartbeat every 30 seconds to keep connection alive
+                    # if retries > 0 and retries % 30 == 0:
+                    #     yield b"data: {\"type\":\"heartbeat\"}\n"
 
-                        _, message_list = message
+                    # messages = await redis_xread(redis, {channel: '0'}, count=None, block=10000)
+                    if (retries > max_retries and not completed_yielded) or (celery_task.ready() and retries > 3):
+                        logger.info(f"Task {task_id}: Ending stream after {retries} retries with no activity")
+                        # if not completed_yielded:
+                        #     yield b"data: {\"message\":\"completed\",\"type\":\"auto_complete\"}\n\n"
+                        # yield b"data: [DONE]\n\n"
+                        break
+                    elif retries > max_retries and not completed_yielded and (celery_task.state in {"PENDING", "STARTED"}):
+                        retries = 0
 
-                        for msg_id, msg_data in message_list:
-                            if isinstance(msg_data, bytes):
-                                msg_data_dict = json.loads(msg_data.decode("utf-8"))
-                            elif isinstance(msg_data, dict):
-                                msg_data_dict = msg_data
-                            else:
-                                logger.warning(f"Unexpected msg_data format: {msg_data}")
-                                continue
+
+                    # Read from Redis stream
+                    messages = await pure_redis.xread({channel: last_id}, count, block=block_ms)
+
+
+                    if messages and isinstance(messages, list):
+                        # Reset retry counter when we get messages
+                        retries = 0
+                        logger.info(f"Received messages from Redis: {len(messages)} messages")
+
+                        for _, message_list in messages:
+                            for msg_id, msg_data in message_list:
+                                last_id = msg_id  # Update last_id after each message
+
+                                try:
+                                    if isinstance(msg_data, bytes):
+                                        msg_data_dict = json.loads(msg_data.decode("utf-8"))
+                                    elif isinstance(msg_data, dict):
+                                        msg_data_dict = msg_data
+                                    else:
+                                        logger.warning(f"Unexpected msg_data format: {msg_data}")
+                                        continue
+                                except json.JSONDecodeError as e:
+                                        logger.error(f"JSON decode error: {e} for message: {msg_data}")
+                                        continue
+                                        
+                                # Handle completion message
+                                if msg_data_dict.get("message") == "completed":
+                                    if not completed_yielded:
+                                        logger.info(f"Task {task_id}: Yielding completion message")
+                                        # ADD 'data: ' PREFIX HERE
+                                        yield f"data: {json.dumps(msg_data_dict, ensure_ascii=False)}\n\n".encode('utf-8')
+                                        completed_yielded = True
+                                        yield b"data: [DONE]\n\n"
+                                        return
+                                    continue
+
+                                # Create unique ID to detect duplicates
+                                unique_id = (
+                                    f"{msg_data_dict.get('chunk_index', '')}_{msg_data_dict.get('url', msg_id)}"
+                                    if "chunk_index" in msg_data_dict 
+                                    else msg_data_dict.get("id", msg_data_dict.get("url", msg_id))
+                                )
+
+                                # Skip duplicates
+                                if unique_id in seen_messages:
+                                    # logger.info(f"Duplicate message ignored {msg_id}: {unique_id}")
+                                    continue
+                                
+                                # Add to seen messages and yield to client
+                                seen_messages.add(unique_id)
+                                
+                                # ADD 'data: ' PREFIX HERE
+                                yield f"data: {json.dumps(msg_data_dict, ensure_ascii=False)}\n\n".encode('utf-8')
+                    else:
+                        # No messages - increment retry counter
+                        retries += 1
+                        logger.warning(f"No messages returned or malformed response. Retry count: {retries}")
                         
-                            if isinstance(msg_data_dict, dict) and "message" in msg_data_dict and msg_data_dict["message"] == "completed":
-                                if not completed_yielded:
-                                    logger.info("Yielding completed message.")
-                                    # ADD 'data: ' PREFIX HERE
-                                    yield ("data: " + json.dumps(msg_data_dict, ensure_ascii=False) + "\n").encode('utf-8')
-                                    completed_yielded = True
-                                    break
-                                continue
+                except Exception as e:
+                    logger.exception("Error reading from Redis stream")
+                    # Send error to client as an SSE event
+                    # Send generic error to client as an SSE event
+                    yield f"event: error\ndata: {json.dumps({'error': 'stream read error'})}\n\n".encode('utf-8')
+                    # Optionally end the stream after a serious error
+                    retries += 1
+                
+                # Pause before next poll
+                await asyncio.sleep(poll_interval)
 
-                            unique_id = f"{msg_data_dict.get('chunk_index', '')}_{msg_data_dict.get('url', msg_id)}"  \
-                                if "chunk_index" in msg_data_dict else msg_data_dict.get("id",msg_data_dict.get("url", msg_id))
-                            
-                            if unique_id in seen_messages:
-                                logger.info(f"Duplicate message ignored {msg_id}: {unique_id}")
-                                continue
+        except asyncio.CancelledError:
+            logger.info("Task %s: Stream cancelled by client", task_id)
+            yield b"event: canceled\ndata: {\"message\":\"stream_cancelled\"}\n\n"
 
-                            seen_messages.add(unique_id)
+        except Exception as e:
+            logger.exception("Fatal error in event stream")
+            yield f"event: error\ndata: {json.dumps({'error': 'fatal stream error', 'fatal': True})}\n\n".encode('utf-8')
+        finally:
+            seen_messages.clear()
+            # Always send DONE if we exit the loop without returning
+            if not completed_yielded:
+                yield b"data: [DONE]\n\n"
+            logger.info(f"Task {task_id}: Stream closed")
 
-                            logger.info(f"Received message on str {msg_id}")
-                            
-                            retries = 0
-                            # ADD 'data: ' PREFIX HERE
-                            yield  ("data: " + json.dumps(msg_data_dict, ensure_ascii=False) + "\n").encode('utf-8')
-                else:
-                    logger.warning("No messages returned or malformed response.")
-                    
-            except Exception as e:
-                logger.error(f"Error in event stream: {e}")
-            
-            finally:
-                logger.info("Closing the event stream.")
-
-            if completed_yielded :
-                yield b"data: [DONE]\n"
-                break
-            else:
-                retries += 1
-                logger.info(f"No completed message received. Continuing to listen for new messages. Retry count: {retries}")
-
-        seen_messages.clear()
     return StreamingResponse(
         event_stream(channel),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable proxy buffering
             "X-Stream-Status": "active",
         })
 

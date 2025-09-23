@@ -12,7 +12,7 @@ from crawl4ai import (
     DefaultMarkdownGenerator,
     PruningContentFilter,
 )
-from fastapi import Request, Response
+from fastapi import Request, Response, status
 from fastapi.responses import StreamingResponse
 import psutil
 from functools import partial
@@ -132,7 +132,7 @@ async def reader(request: Request, response: Response) -> Response:
 
         # Return 406 Not Acceptable if Accept header is not supported
         return Response(
-            b"Unsupported Accept header", media_type="application/json", status_code=406
+            b"Unsupported Accept header", media_type="application/json", status_code=status.HTTP_406_NOT_ACCEPTABLE
         )
 
     except Exception as e:

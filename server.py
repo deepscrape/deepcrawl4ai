@@ -8,7 +8,6 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Callable
-import signal
 
 # from typing import Annotated  # noqa: F401
 from crawl4ai import AsyncWebCrawler, BrowserConfig
@@ -17,20 +16,12 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Request,
+    WebSocket,
     status
 )
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.datastructures import Address # Import Address
-from fastapi import (
-    Depends,
-    FastAPI,
-    HTTPException,
-    Request,
-    status
-)
-from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
@@ -70,7 +61,7 @@ setup_logging(config)
 logger = logging.getLogger(__name__)
 
 
-__version__ = config["app"]["version"] or "0.5.1-d1"
+__version__ = config["app"]["version"] or "0.0.1-d1"
 
 # ── global page semaphore (hard cap) ─────────────────────────
 MAX_PAGES = config["crawler"]["pool"].get("max_pages", 30)
@@ -85,11 +76,19 @@ async def capped_arun(self, *a, **kw):
 AsyncWebCrawler.arun = capped_arun
 
 
+orig_arun_many = AsyncWebCrawler.arun_many
+
+async def capped_arun_many(self, urls, config=None, dispatcher=None, **kwargs):
+    async with GLOBAL_SEM:
+        return await orig_arun_many(self, urls, config, dispatcher, **kwargs)
+AsyncWebCrawler.arun_many = capped_arun_many
+
+
 # Set the number of workers
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", os.cpu_count() or 1))
 
 # Store connected WebSocket clients    
-socket_client = set()
+socket_client: set[WebSocket] = set()
 
 if sys.platform != "win32":
     import uvloop  # type: ignore
@@ -99,6 +98,12 @@ else:
     asyncio.set_event_loop_policy(EventLoopPolicy())
     # logger.warning("uvloop is not supported on Windows, using default(auto) event loop")
 
+production = os.getenv("PYTHON_ENV", "development").lower() == "production"
+if production:
+    print("\033[94mINFO-SERVER:\033[0m  \033[92mRunning in Production mode. PYTHON_ENV\033[0m", production)
+else:
+    print("\033[94mWARNIN-SERVER:\033[92m Running in Development mode. PYTHON_ENV", production)
+    
 ###############################################################
 # ───────────────────── FastAPI lifespan ──────────────────────
 ###############################################################
@@ -113,7 +118,7 @@ async def lifespan(_: FastAPI):
             **config["crawler"]["browser"].get("kwargs", {}),
         ))           # warm‑up
         await test_connection(redis) # Moved from on_event("startup")
-        await test_connection(pure_redis) # Moved from on_event("startup")
+        # await test_connection(pure_redis) # Moved from on_event("startup")
         app.state.janitor = asyncio.create_task(janitor())        # idle GC
         app.state.websocket = asyncio.create_task(periodic_client_cleanup(socket_client))
         yield
@@ -274,6 +279,17 @@ verify_token = get_token_dependency(config)
 # ───────────────────── FastAPI middlewares ──────────────────────
 ################################################################
 
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = f"{process_time * 1000:.2f}"
+
+    print(f"Request: {request.url.path} - Response time: {process_time * 1000:.2f} ms")
+    return response
+
 # security headers middleware
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -334,7 +350,7 @@ async def rate_limit_middleware(request: Request, call_next):
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config["app"].get("cors_origins", ["*"]),
+    allow_origins=config["app"].get("cors_origins" if production else "cors_origins_dev", ["*"]),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -365,8 +381,16 @@ async def root(decoded_token: bool = Depends(verify_token)):
 
 # health check endpoint
 @app.get(config["observability"]["health_check"]["endpoint"])
-async def health():
-    return {"status": "ok", "timestamp": time.time(), "version": __version__}
+@app.get(config["observability"]["health_check"]["endpoint"])
+async def health(_: Request):
+    """Health check endpoint."""
+    try:
+        return JSONResponse({"status": "ok", "timestamp": time.time(), "version": __version__})
+    
+    except Exception:
+        logger.exception("Health check failed")
+        # Do not expose internal error details to clients
+        return JSONResponse({"status": "error"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 # prometheus metrics endpoint
 @app.get(config["observability"]["prometheus"]["endpoint"])

@@ -1,6 +1,7 @@
 fastapi
 gunicorn
 dotenv
+websockets
 uvicorn[standard]
 crawl4ai
 uvloop
@@ -8,7 +9,7 @@ beautifulsoup4~=4.12
 tf-playwright-stealth>=1.1.0
 firebase-admin
 google-cloud-firestore
-upstash-redis
+upstash-redis~=1.4.0
 upstash_ratelimit
 apscheduler
 pydantic>=2.10

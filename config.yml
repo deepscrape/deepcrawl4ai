@@ -8,8 +8,13 @@ app:
   workers: 1
   uvloop: auto
   timeout_keep_alive: 300
-  cors_origins:
+  cors_origins_dev:
     - "http://localhost:4200"
+    - "http://localhost:8081"
+    - "http://localhost:5000"
+    - "https://deepscrape.web.app"
+    - "https://deepscrape.dev"
+  cors_origins:
     - "https://deepscrape.web.app"
     - "https://deepscrape.dev"
   gzip:
