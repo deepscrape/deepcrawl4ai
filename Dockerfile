@@ -119,7 +119,7 @@ COPY --chown=appuser:appuser . .
 COPY --chown=appuser:appuser config.yml .
 
 # Set display environment variable
-ENV DISPLAY=:99
+# ENV DISPLAY=:99
 
 # Run diagnostics
 RUN crawl4ai-doctor
@@ -142,6 +142,4 @@ USER appuser
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 # Start application
-CMD ["sh", "-c", "\
-    /opt/noVNC/utils/websockify/run --web /opt/noVNC 0.0.0.0:6080 0.0.0.0:5900 & \
-    uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port 8000 --ws websockets"]
