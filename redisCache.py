@@ -166,7 +166,7 @@ async def redis_xadd(pipe, channel: str, message: dict, maxlen: Optional[int] = 
         return None
     
 
-async def redis_xread(redis: Redis, streams: dict, count: Optional[int] = None, block: Optional[int] = None):
+async def redis_xread(redis: Redis | PureRedis, streams: dict, count: Optional[int] = None, block: Optional[int] = None):
     """
     Read messages from a Redis stream using XREAD.
     :param redis: Redis client (PureRedis)
@@ -194,7 +194,11 @@ async def redis_xread(redis: Redis, streams: dict, count: Optional[int] = None, 
             command.append(channel)
         for channel, last_id in streams.items():
             command.append(last_id)
-        result = await redis.execute(command)
+        # Flatten into varargs for the underlying client
+        if hasattr(redis, "execute"):
+            result = await redis.execute(command[0], *command[1:])
+        else:
+            result = await redis.execute_command(*command)
         return result
     except Exception as e:
         print(f"\033[91mERROR-DB:\033[0m Failed to read from stream(s) '{list(streams.keys())}': {e}")
